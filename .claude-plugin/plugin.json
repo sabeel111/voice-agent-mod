@@ -1,0 +1,153 @@
+{
+  "name": "voice-agent",
+  "version": "0.1.0",
+  "description": "Talk with Claude out loud, fully local: Whisper hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
+  "author": {
+    "name": "sabeel111"
+  },
+  "repository": "https://github.com/sabeel111/voice-agent-mod",
+  "license": "Apache-2.0",
+  "keywords": [
+    "voice",
+    "speech",
+    "tts",
+    "stt",
+    "whisper",
+    "phonon",
+    "hyprland",
+    "agents"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoStart": {
+      "type": "boolean",
+      "title": "Start voice with each session",
+      "description": "Turn voice on as soon as a session starts, instead of with /talk on.",
+      "default": false
+    },
+    "mode": {
+      "type": "string",
+      "title": "Listening mode",
+      "description": "wake: say the wake word first. natural: the mic is always open. ptt: only while the push-to-talk key is held. Push-to-talk works in every mode.",
+      "default": "wake",
+      "options": [
+        "wake",
+        "natural",
+        "ptt"
+      ]
+    },
+    "wakeWord": {
+      "type": "string",
+      "title": "Wake word",
+      "description": "The phrase that starts a request in wake mode.",
+      "default": "hey claude"
+    },
+    "sttModel": {
+      "type": "string",
+      "title": "Speech recognition model",
+      "description": "faster-whisper model. tiny.en is fastest, small.en is most accurate; use a model without .en for other languages.",
+      "default": "base.en",
+      "options": [
+        "tiny.en",
+        "base.en",
+        "small.en",
+        "distil-small.en",
+        "tiny",
+        "base",
+        "small",
+        "large-v3-turbo"
+      ]
+    },
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language code for recognition and speech: en, fr, de, es or pt. Other than en needs a multilingual voice model and a non-.en recognition model.",
+      "default": "en",
+      "options": [
+        "en",
+        "fr",
+        "de",
+        "es",
+        "pt"
+      ]
+    },
+    "ttsModel": {
+      "type": "string",
+      "title": "Phonon voice model",
+      "description": "Empty uses Phonon 31m (English, Apache 2.0). For example hf://gradium/phonon-40m-en (non-commercial, gated: accept its terms on Hugging Face and run hf auth login).",
+      "default": ""
+    },
+    "ttsVoice": {
+      "type": "string",
+      "title": "Voice",
+      "description": "A Phonon voice name (list them with: uvx ptts --list-voices). Empty uses the model's default.",
+      "default": ""
+    },
+    "bargeIn": {
+      "type": "boolean",
+      "title": "Interrupt by talking",
+      "description": "Talking while Claude speaks stops it. In natural mode this works best with headphones or PipeWire echo cancellation.",
+      "default": true
+    },
+    "followUpSeconds": {
+      "type": "number",
+      "title": "Follow-up window (seconds)",
+      "description": "In wake mode, how long after Claude speaks you can answer without the wake word.",
+      "default": 8
+    },
+    "chimes": {
+      "type": "boolean",
+      "title": "Chimes",
+      "description": "Short sounds when the wake word is heard, push-to-talk starts and ends, and a question is asked.",
+      "default": true
+    },
+    "voicePermissions": {
+      "type": "boolean",
+      "title": "Answer permission prompts by voice",
+      "description": "When Claude or an agent needs permission, ask out loud and take a spoken yes or no. No answer falls back to the usual prompt.",
+      "default": true
+    },
+    "askTimeoutSeconds": {
+      "type": "number",
+      "title": "Spoken question timeout (seconds)",
+      "default": 30,
+      "description": "How long to wait for a spoken yes or no before falling back to the usual permission prompt."
+    },
+    "partnerModel": {
+      "type": "string",
+      "title": "Model for the conversation",
+      "description": "Model alias or id for the main, talking Claude while voice is on (a faster model feels more natural). Empty uses the session's model.",
+      "default": ""
+    },
+    "partnerEffort": {
+      "type": "string",
+      "title": "Thinking effort for the conversation",
+      "description": "Lower effort answers faster. default uses the session's setting.",
+      "default": "default",
+      "options": [
+        "default",
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "agentModel": {
+      "type": "string",
+      "title": "Model for background agents",
+      "description": "Empty lets the agent type decide.",
+      "default": ""
+    },
+    "agentType": {
+      "type": "string",
+      "title": "Agent type for tasks",
+      "description": "The subagent type tasks are handed to. Empty uses general-purpose.",
+      "default": ""
+    },
+    "helperCommand": {
+      "type": "string",
+      "title": "Voice helper command",
+      "description": "Advanced: how to start the voice helper instead of uv run --script, e.g. ~/.venvs/voice/bin/python /path/to/voice_helper.py",
+      "default": ""
+    }
+  }
+}
