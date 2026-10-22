@@ -114,6 +114,10 @@ class Config:
     barge_in: bool = True
     barge_in_rms: float = 0.03
     barge_in_ms: int = 300
+    # Hands-free speech must be this many times louder than the background
+    # noise floor (a slow running average of the mic level), so other voices
+    # and the TV don't count as speech. 0 or less turns the check off.
+    loudness_ratio: float = 2.0
     # Without turn detection (or when its model fails to load), an utterance
     # ends after this much silence.
     silence_ms: int = 500
@@ -651,6 +655,12 @@ class Speaker:
 # Listening
 
 
+# Background noise floor for the loudness gate: its time constant, and a
+# minimum so a silent room doesn't let any sound through.
+NOISE_FLOOR_MS = 3000
+NOISE_FLOOR_MIN = 0.002
+
+
 class Listener:
     """Turns 30 ms mic frames into utterances.
 
@@ -694,6 +704,9 @@ class Listener:
         self.silence = 0
         self.voiced = 0
         self.loud_run = 0
+        # Background loudness (RMS), and how many frames have shaped it.
+        self.noise_floor = NOISE_FLOOR_MIN
+        self.noise_frames = 0
         self.ptt = False
         self.ptt_buf: list[bytes] = []
         self.lock = threading.Lock()
@@ -738,7 +751,7 @@ class Listener:
             return
 
         speaking = self.is_speaking()
-        voiced = self.vad(frame)
+        voiced = raw_voiced = self.vad(frame)
         if speaking and self.cfg.barge_in and self.cfg.mode == "natural":
             # Our own voice leaks into the mic: only a loud, sustained voice
             # counts as the person cutting in.
@@ -751,6 +764,13 @@ class Listener:
             else:
                 self.preroll.append(frame)
             return
+
+        level = rms(frame)
+        if voiced and self.cfg.loudness_ratio > 0:
+            voiced = level >= self.cfg.loudness_ratio * self.noise_floor
+        # Our own voice leaking into the mic is not background noise.
+        if not speaking and (not self.in_speech or not raw_voiced):
+            self._track_noise(level)
 
         self.window.append(voiced)
         if not self.in_speech:
@@ -781,6 +801,16 @@ class Listener:
             self._reset_vad()
             if voiced_ms >= self.cfg.min_utterance_ms:
                 self.on_utterance(audio, "voice", None if too_long else key)
+
+    def _track_noise(self, level: float) -> None:
+        """Fold one frame into the background noise floor.
+
+        A running mean for the first few seconds, so the floor settles fast,
+        then an exponential moving average over about NOISE_FLOOR_MS.
+        """
+        self.noise_frames += 1
+        alpha = max(FRAME_MS / NOISE_FLOOR_MS, 1.0 / self.noise_frames)
+        self.noise_floor = max(NOISE_FLOOR_MIN, self.noise_floor + alpha * (level - self.noise_floor))
 
     # ---- end-of-turn detection
     def _ask_turn(self, audio: bytes, key: tuple[int, int]) -> None:

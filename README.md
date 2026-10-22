@@ -123,6 +123,7 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | Smart end-of-turn detection | on | Answer as soon as you sound finished; wait through pauses mid-sentence. Off: a fixed 0.5 s pause ends what you say |
 | Voice detection strictness | `3` | `0` to `3`. Higher ignores more background noise but may miss very quiet speech |
 | Minimum speech length (ms) | 500 | Shorter sounds are ignored |
+| Minimum loudness over background | 2 | How many times louder than the background noise speech must be. Higher ignores more background voices; `0` turns it off |
 | Language | `en` | Other languages need a multilingual Phonon 40m model and `parakeet-v3` |
 | Phonon voice model | Phonon 31m | e.g. `hf://gradium/phonon-40m-en` (non-commercial license, gated: accept its terms on Hugging Face, then `hf auth login`) |
 | Voice | model default | List voices with `uvx ptts --list-voices` |

@@ -171,6 +171,7 @@ export const register: Register = (on, options) => {
         turn_detection: opt.turnDetection,
         vad_aggressiveness: opt.vadStrictness,
         min_utterance_ms: opt.minSpeechMs,
+        loudness_ratio: opt.loudnessRatio,
         stt_language: opt.language,
         tts_model: opt.ttsModel,
         tts_voice: opt.ttsVoice,
@@ -516,6 +517,7 @@ type Options = {
   turnDetection: boolean
   vadStrictness: number
   minSpeechMs: number
+  loudnessRatio: number
   language: string
   ttsModel: string
   ttsVoice: string
@@ -547,6 +549,7 @@ function readOptions(o: PluginOptions): Options {
     turnDetection: bool('turnDetection', true),
     vadStrictness: Number.isFinite(vadRaw) ? Math.min(3, Math.max(0, Math.trunc(vadRaw))) : 3,
     minSpeechMs: Math.max(0, Math.round(num('minSpeechMs', 500))),
+    loudnessRatio: Math.max(0, num('loudnessRatio', 2)),
     language: str('language') || 'en',
     ttsModel: str('ttsModel'),
     ttsVoice: str('ttsVoice'),

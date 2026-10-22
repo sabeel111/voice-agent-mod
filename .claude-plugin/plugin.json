@@ -1,6 +1,6 @@
 {
   "name": "voice-agent",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Talk with Claude out loud, fully local: Parakeet hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
   "author": {
     "name": "sabeel111"
@@ -85,6 +85,12 @@
       "title": "Minimum speech length (ms)",
       "description": "Sounds shorter than this are ignored.",
       "default": 500
+    },
+    "loudnessRatio": {
+      "type": "number",
+      "title": "Minimum loudness over background",
+      "description": "How many times louder than the background noise speech must be. Higher ignores more background voices; 0 turns it off.",
+      "default": 2
     },
     "language": {
       "type": "string",

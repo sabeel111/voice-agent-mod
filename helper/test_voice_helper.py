@@ -223,7 +223,7 @@ def silent_frame():
 def make_listener(mode="natural", speaking=lambda: False, pauses=None):
     got: list[tuple[int, str]] = []
     barge: list[int] = []
-    cfg = vh.Config(mode=mode, silence_ms=300, early_ms=90, min_utterance_ms=200)
+    cfg = vh.Config(mode=mode, silence_ms=300, early_ms=90, min_utterance_ms=200, loudness_ratio=0)
     lis = vh.Listener(
         cfg,
         vad=lambda f: vh.rms(f) > 0.01,
@@ -234,6 +234,56 @@ def make_listener(mode="natural", speaking=lambda: False, pauses=None):
         on_pause=(lambda audio, key: pauses.append(key)) if pauses is not None else (lambda audio, key: None),
     )
     return lis, got, barge
+
+
+def frame_at(amplitude):
+    return (np.ones(vh.FRAME_SAMPLES, dtype=np.int16) * amplitude).tobytes()
+
+
+def make_gated_listener(ratio):
+    """A listener whose VAD calls everything speech, so only loudness decides."""
+    got: list = []
+    cfg = vh.Config(mode="natural", silence_ms=300, early_ms=90, min_utterance_ms=200,
+                    turn_detection=False, loudness_ratio=ratio)
+    lis = vh.Listener(
+        cfg,
+        vad=lambda f: True,
+        on_utterance=lambda audio, src, key: got.append((len(audio), src, key)),
+        is_speaking=lambda: False,
+        on_barge_in=lambda: None,
+        on_hearing=lambda h: None,
+    )
+    return lis, got
+
+
+def test_listener_ignores_voices_not_louder_than_the_background():
+    lis, got = make_gated_listener(2.0)
+    for _ in range(100):  # 3 s of background chatter
+        lis.feed(frame_at(500))
+    for _ in range(30):  # a bit louder, but under twice the background
+        lis.feed(frame_at(800))
+    for _ in range(15):
+        lis.feed(frame_at(500))
+    assert got == []
+    assert not lis.in_speech
+
+
+def test_listener_hears_speech_well_above_the_background():
+    lis, got = make_gated_listener(2.0)
+    for _ in range(100):
+        lis.feed(frame_at(500))
+    for _ in range(30):
+        lis.feed(frame_at(3000))
+    for _ in range(15):
+        lis.feed(frame_at(500))  # back to background: the utterance ends
+    assert len(got) == 1 and got[0][1] == "voice"
+
+
+def test_listener_loudness_ratio_zero_turns_the_gate_off():
+    lis, got = make_gated_listener(0)
+    for _ in range(100):
+        lis.feed(frame_at(500))
+    assert lis.in_speech
 
 
 def test_listener_pause_key_matches_the_utterance_that_follows():
@@ -603,6 +653,7 @@ def test_ends_mid_sentence(text, expected):
 def make_turn_listener(turn, check_text=False, **cfg_overrides):
     got: list = []
     pauses: list = []
+    cfg_overrides.setdefault("loudness_ratio", 0)
     cfg = vh.Config(mode="natural", silence_ms=300, early_ms=90, min_utterance_ms=200,
                     turn_max_silence_ms=900, **cfg_overrides)
     lis = vh.Listener(
