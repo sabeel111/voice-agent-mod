@@ -577,3 +577,173 @@ def test_main_end_to_end(events, monkeypatch):
     t.join(5)
     assert rc == [0]
     assert not os.path.exists(sock)
+
+
+# --------------------------------------------------------------------------
+# end-of-turn detection
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Can you run the tests?", False),
+        ("Fix the login bug.", False),
+        ("Can you check whether the", True),
+        ("So I was thinking we could, um", True),
+        ("refactor the handler and", True),
+        ("I want to,", True),
+        ("Let me think...", True),
+        ("", False),
+    ],
+)
+def test_ends_mid_sentence(text, expected):
+    assert vh.ends_mid_sentence(text) is expected
+
+
+def make_turn_listener(turn, check_text=False, **cfg_overrides):
+    got: list = []
+    pauses: list = []
+    cfg = vh.Config(mode="natural", silence_ms=300, early_ms=90, min_utterance_ms=200,
+                    turn_max_silence_ms=900, **cfg_overrides)
+    lis = vh.Listener(
+        cfg,
+        vad=lambda f: vh.rms(f) > 0.01,
+        on_utterance=lambda audio, src, key: got.append((len(audio), src, key)),
+        is_speaking=lambda: False,
+        on_barge_in=lambda: None,
+        on_hearing=lambda h: None,
+        on_pause=lambda audio, key: pauses.append(key),
+        turn=turn,
+        check_text=check_text,
+    )
+    lis.turn_sync = True
+    return lis, got, pauses
+
+
+def silent_frames_until_utterance(lis, got, limit=60):
+    """Feed silence until an utterance ends; return how many frames it took."""
+    for n in range(1, limit + 1):
+        lis.feed(silent_frame())
+        if got:
+            return n
+    return None
+
+
+def test_turn_complete_ends_the_utterance_at_the_short_pause(events):
+    seen: list = []
+    lis, got, pauses = make_turn_listener(lambda audio: seen.append(len(audio)) or 0.95)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    # early_ms=90: three silent frames, not the ten that silence_ms=300 needs
+    assert silent_frames_until_utterance(lis, got) == 3
+    assert len(seen) == 1 and seen[0] > 0
+    assert got[0][2] == pauses[0]  # the early transcript is reused
+    assert any("turn complete" in e["msg"] for e in events.of("log"))
+
+
+def test_turn_incomplete_keeps_listening_through_a_long_pause():
+    lis, got, _ = make_turn_listener(lambda audio: 0.05)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    for _ in range(20):  # 600 ms: past silence_ms, short of turn_max_silence_ms
+        lis.feed(silent_frame())
+    assert got == []
+    for _ in range(20):  # they go on
+        lis.feed(voiced_frame())
+    assert got == []
+    # The next pause is judged afresh; still unfinished, it ends at 900 ms.
+    assert silent_frames_until_utterance(lis, got) == 30
+    assert len(got) == 1
+
+
+def test_turn_detection_off_uses_the_fixed_pause():
+    lis, got, _ = make_turn_listener(None)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    assert silent_frames_until_utterance(lis, got) == 10  # silence_ms=300
+
+
+def test_turn_model_failure_falls_back_to_the_fixed_pause(events):
+    def broken(audio):
+        raise RuntimeError("boom")
+
+    lis, got, _ = make_turn_listener(broken)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    assert silent_frames_until_utterance(lis, got) == 10
+    assert any("turn detection failed" in e["msg"] for e in events.of("log"))
+
+
+def test_turn_waits_for_a_model_that_has_not_answered():
+    lis, got, _ = make_turn_listener(lambda audio: 0.95)
+    lis.turn_sync = False
+    gate = threading.Event()
+    lis.turn = lambda audio: gate.wait(5) and 0.95
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    for _ in range(15):  # past silence_ms with no answer yet: don't cut in
+        lis.feed(silent_frame())
+    assert got == []
+    gate.set()
+    wait_until(lambda: lis.turn_result is not None)
+    lis.feed(silent_frame())
+    assert len(got) == 1
+
+
+def test_turn_complete_but_dangling_transcript_keeps_listening():
+    lis, got, pauses = make_turn_listener(lambda audio: 0.95, check_text=True)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    for _ in range(3):
+        lis.feed(silent_frame())
+    lis.turn_text(pauses[0], "Can you check whether the")
+    for _ in range(20):  # 690 ms of silence in all: still waiting
+        lis.feed(silent_frame())
+    assert got == []
+    assert silent_frames_until_utterance(lis, got) == 7  # 900 ms
+
+
+def test_turn_complete_ends_as_soon_as_the_transcript_agrees():
+    lis, got, pauses = make_turn_listener(lambda audio: 0.95, check_text=True)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    for _ in range(4):
+        lis.feed(silent_frame())
+    assert got == []  # the transcript is not in yet
+    lis.turn_text(pauses[0], "Run the tests.")
+    assert silent_frames_until_utterance(lis, got) == 1
+
+
+def test_turn_complete_without_a_transcript_ends_after_the_usual_pause():
+    lis, got, _ = make_turn_listener(lambda audio: 0.95, check_text=True)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    assert silent_frames_until_utterance(lis, got) == 10
+
+
+def test_controller_passes_the_early_transcript_to_the_turn_check(events):
+    cfg = vh.Config(mode="natural")
+    stt = ScriptedSTT()
+    stt.texts = ["Can you check whether the"]
+    ctl = vh.Controller(cfg, stt, lambda c: vh.Speaker(FakeTTS(), FakePlayer(), c.on_speaking),
+                        turn=lambda audio: 0.9)
+    assert ctl.listener.turn is not None and ctl.listener.check_text
+    ctl._on_pause(b"\0\0" * 1600, (1, 40))
+    wait_until(lambda: ctl.listener.text_result == ((1, 40), False))
+
+
+def test_smart_turn_features_shape():
+    feats = vh.whisper_features(np.random.default_rng(0).standard_normal(16000).astype(np.float32) * 0.1)
+    assert feats.shape == (80, 800) and feats.dtype == np.float32
+    # front-padded: the first 7 s are the same (silent) column throughout
+    assert np.allclose(feats[:, :600], feats[:, :1])
+    assert not np.allclose(feats[:, -50:], feats[:, :1])
+
+
+def test_main_falls_back_when_the_turn_model_will_not_load(events, monkeypatch):
+    def no_model(cfg):
+        raise RuntimeError("no network")
+
+    monkeypatch.setattr(vh, "SmartTurn", no_model)
+    test_main_end_to_end(events, monkeypatch)
+    assert any("turn detection unavailable" in e["msg"] for e in events.of("log"))
