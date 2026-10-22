@@ -126,9 +126,9 @@ class Config:
     turn_detection: bool = True
     turn_threshold: float = 0.5  # probability of "finished" that ends the turn
     turn_max_silence_ms: int = 1200
-    min_utterance_ms: int = 350
+    min_utterance_ms: int = 500
     max_utterance_s: float = 30.0
-    vad_aggressiveness: int = 2
+    vad_aggressiveness: int = 3
     capture_cmd: list[str] = field(default_factory=list)
     playback_cmd: list[str] = field(default_factory=list)
     chimes: bool = True
@@ -1238,7 +1238,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         tts = PhononTTS(cfg)
         import webrtcvad
 
-        vad_engine = webrtcvad.Vad(int(cfg.vad_aggressiveness))
+        vad_engine = webrtcvad.Vad(min(3, max(0, int(cfg.vad_aggressiveness))))
         player_argv = playback_command(cfg, tts.sample_rate)
         chime_argv = playback_command(cfg, 24_000)
         mic_argv = capture_command(cfg)

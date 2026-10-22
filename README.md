@@ -121,6 +121,8 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | Speech recognition model | `parakeet-v2` | English; `parakeet-v3` covers 25 European languages |
 | Speech recognition device | `auto` | An NVIDIA GPU when there is one, else the CPU. `cpu` skips the GPU download |
 | Smart end-of-turn detection | on | Answer as soon as you sound finished; wait through pauses mid-sentence. Off: a fixed 0.5 s pause ends what you say |
+| Voice detection strictness | `3` | `0` to `3`. Higher ignores more background noise but may miss very quiet speech |
+| Minimum speech length (ms) | 500 | Shorter sounds are ignored |
 | Language | `en` | Other languages need a multilingual Phonon 40m model and `parakeet-v3` |
 | Phonon voice model | Phonon 31m | e.g. `hf://gradium/phonon-40m-en` (non-commercial license, gated: accept its terms on Hugging Face, then `hf auth login`) |
 | Voice | model default | List voices with `uvx ptts --list-voices` |

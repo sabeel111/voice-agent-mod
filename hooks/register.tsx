@@ -169,6 +169,8 @@ export const register: Register = (on, options) => {
         stt_model: opt.sttModel,
         stt_device: opt.sttDevice,
         turn_detection: opt.turnDetection,
+        vad_aggressiveness: opt.vadStrictness,
+        min_utterance_ms: opt.minSpeechMs,
         stt_language: opt.language,
         tts_model: opt.ttsModel,
         tts_voice: opt.ttsVoice,
@@ -512,6 +514,8 @@ type Options = {
   sttModel: string
   sttDevice: string
   turnDetection: boolean
+  vadStrictness: number
+  minSpeechMs: number
   language: string
   ttsModel: string
   ttsVoice: string
@@ -533,6 +537,7 @@ function readOptions(o: PluginOptions): Options {
   const num = (k: string, d: number) => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : d)
   const mode = str('mode', 'wake')
   const effort = str('partnerEffort', 'default')
+  const vadRaw = typeof o.vadStrictness === 'number' ? o.vadStrictness : parseInt(str('vadStrictness', '3'), 10)
   return {
     autoStart: bool('autoStart', false),
     mode: mode === 'natural' || mode === 'ptt' ? mode : 'wake',
@@ -540,6 +545,8 @@ function readOptions(o: PluginOptions): Options {
     sttModel: str('sttModel') || 'parakeet-v2',
     sttDevice: str('sttDevice') || 'auto',
     turnDetection: bool('turnDetection', true),
+    vadStrictness: Number.isFinite(vadRaw) ? Math.min(3, Math.max(0, Math.trunc(vadRaw))) : 3,
+    minSpeechMs: Math.max(0, Math.round(num('minSpeechMs', 500))),
     language: str('language') || 'en',
     ttsModel: str('ttsModel'),
     ttsVoice: str('ttsVoice'),
