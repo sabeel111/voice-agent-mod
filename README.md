@@ -4,7 +4,8 @@ Talk with Claude Code out loud, like talking to a colleague. You discuss a task,
 
 All the speech runs on your own machine:
 
-- **Hearing:** NVIDIA [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) through [onnx-asr](https://github.com/istupakov/onnx-asr), on an NVIDIA GPU when there is one, else int8 on the CPU, with WebRTC voice detection. It transcribes during the pause at the end of what you say, so the text is usually ready the moment the pause is long enough to count as the end (about 0.4 s after you stop on a laptop CPU).
+- **Hearing:** NVIDIA [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) through [onnx-asr](https://github.com/istupakov/onnx-asr), on an NVIDIA GPU when there is one, else int8 on the CPU, with WebRTC voice detection. It transcribes during the pause at the end of what you say, so the text is usually ready the moment the pause counts as the end.
+- **Knowing when you're done:** [Smart Turn v3](https://huggingface.co/pipecat-ai/smart-turn-v3) by Pipecat (BSD 2-Clause, 9 MB int8 ONNX) listens to how a sentence ends. If you sound finished, Claude answers about 0.15 s into the pause; if you trail off mid-thought ("can you check whether the…", "so I was thinking, um…"), it waits up to 1.2 s for you to go on. See [End-of-turn detection](#end-of-turn-detection).
 - **Speaking:** [Phonon](https://gradium.ai/phonon) 31m by Gradium: open weights (Apache 2.0), about 65 MB, streams audio while it generates.
 - **Audio:** PipeWire/PulseAudio (`parecord`/`paplay`), falling back to ALSA (`arecord`/`aplay`).
 
@@ -74,7 +75,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 /talk on
 ```
 
-The first start downloads the Parakeet model (about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB) and Phonon 31m (about 65 MB) from Hugging Face, which takes a minute. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
+The first start downloads the Parakeet model (about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB), Phonon 31m (about 65 MB) and Smart Turn v3 (9 MB) from Hugging Face, which takes a minute. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
 
 ### 4. Push-to-talk key (Hyprland)
 
@@ -119,6 +120,7 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | Wake word | `hey claude` | Matched loosely: "hey cloud" and "hey Clyde" also count |
 | Speech recognition model | `parakeet-v2` | English; `parakeet-v3` covers 25 European languages |
 | Speech recognition device | `auto` | An NVIDIA GPU when there is one, else the CPU. `cpu` skips the GPU download |
+| Smart end-of-turn detection | on | Answer as soon as you sound finished; wait through pauses mid-sentence. Off: a fixed 0.5 s pause ends what you say |
 | Language | `en` | Other languages need a multilingual Phonon 40m model and `parakeet-v3` |
 | Phonon voice model | Phonon 31m | e.g. `hf://gradium/phonon-40m-en` (non-commercial license, gated: accept its terms on Hugging Face, then `hf auth login`) |
 | Voice | model default | List voices with `uvx ptts --list-voices` |
@@ -130,6 +132,33 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | Thinking effort for the conversation | default | `low` answers faster |
 | Model / type for background agents | defaults | |
 | Start voice with each session | off | |
+
+## End-of-turn detection
+
+About 0.15 s into each pause, two things run side by side on the CPU:
+
+- **Smart Turn v3**, an audio model (a Whisper Tiny encoder with a classifier, 9 MB int8), gives the probability that you have finished, from the last 8 s of sound: intonation, rhythm and the words themselves.
+- **Parakeet** transcribes what you said so far.
+
+Then:
+
+| Smart Turn says | Transcript | Ends the utterance |
+| --- | --- | --- |
+| finished (p ≥ 0.5) | does not stop on "the", "and", "um", a comma… | as soon as the transcript is in, usually 0.2 to 0.3 s into the pause |
+| finished | stops mid-sentence | after 1.2 s of silence |
+| not finished | | after 1.2 s of silence |
+| model unavailable | | after 0.5 s of silence (the old fixed pause) |
+
+Speaking again during the pause starts over, so a pause for thought never sends half a sentence. The transcript check is for English only; other languages rely on Smart Turn alone.
+
+Measured on a Ryzen 5 5600H laptop (CPU only, int8 Parakeet, a busy machine), from the end of speech to the transcript event, with synthesized speech through a fake real-time mic:
+
+| | Finished sentence (median) | Sentence with a 0.6 s pause in the middle |
+| --- | --- | --- |
+| Fixed 0.5 s pause (before) | 620 ms | cut in two, every time |
+| Smart Turn | 520 ms | kept whole, every time; sent about 0.6 s after the end |
+
+Most of what remains is Parakeet itself (0.2 to 0.3 s for a short request on this CPU) plus the voice detector's own hangover. Smart Turn takes 80 to 150 ms on this CPU (about 10 ms on recent ones with VNNI), but runs alongside the transcription, so it adds nothing. Turn it off with the **Smart end-of-turn detection** setting; the model is downloaded on first use to `~/.cache/voice-agent/models/smart-turn`.
 
 ## Natural mode without headphones: echo cancellation
 
@@ -173,8 +202,8 @@ Layout:
 - `hooks/register.tsx`: the mod. Starts the helper, streams speech, runs the partner prompt, the `delegate_task` and `list_tasks` tools, voice permissions, `/talk` and the Voice pane.
 - `hooks/speech.ts`: sentence splitting, markdown-to-speech, spoken commands, permission wording.
 - `hooks/prompts.ts`: what the model reads.
-- `helper/voice_helper.py`: the local voice process: mic, voice detection, wake word, push-to-talk, Parakeet, Phonon, barge-in and spoken yes/no questions, controlled over a Unix socket.
+- `helper/voice_helper.py`: the local voice process: mic, voice detection, wake word, push-to-talk, Parakeet, Smart Turn end-of-turn detection, Phonon, barge-in and spoken yes/no questions, controlled over a Unix socket.
 
 ## License
 
-Apache 2.0. Phonon 31m weights are Apache 2.0; the Phonon 40m models are CC BY-NC 4.0.
+Apache 2.0. Phonon 31m weights are Apache 2.0; the Phonon 40m models are CC BY-NC 4.0. Smart Turn v3 weights are BSD 2-Clause (Daily).

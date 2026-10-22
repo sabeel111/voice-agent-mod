@@ -13,7 +13,8 @@
 Everything runs on this machine: the microphone is read through PipeWire /
 PulseAudio / ALSA command-line tools, speech is detected with WebRTC VAD,
 transcribed with NVIDIA Parakeet (onnx-asr; on the GPU when there is an
-NVIDIA one) and spoken with Phonon (ptts).
+NVIDIA one) and spoken with Phonon (ptts). Pipecat's Smart Turn model decides
+when the person has finished speaking.
 
 The mod starts this process and reads newline-delimited JSON events from its
 stdout. It sends commands over HTTP on a Unix socket (``--socket``), which is
@@ -113,10 +114,18 @@ class Config:
     barge_in: bool = True
     barge_in_rms: float = 0.03
     barge_in_ms: int = 300
+    # Without turn detection (or when its model fails to load), an utterance
+    # ends after this much silence.
     silence_ms: int = 500
     # Transcribe this far into a pause, so the text is ready when the pause
-    # turns out to be the end of the utterance.
+    # turns out to be the end of the utterance. The turn model also runs here.
     early_ms: int = 150
+    # Smart Turn: an audio model judges, early into each pause, whether the
+    # person has finished. Finished: answer at once. Not finished: wait for up
+    # to turn_max_silence_ms, so a pause mid-sentence does not cut them off.
+    turn_detection: bool = True
+    turn_threshold: float = 0.5  # probability of "finished" that ends the turn
+    turn_max_silence_ms: int = 1200
     min_utterance_ms: int = 350
     max_utterance_s: float = 30.0
     vad_aggressiveness: int = 2
@@ -244,6 +253,26 @@ def is_echo(heard: str, spoken: str, threshold: float = 0.6) -> bool:
         return " ".join(a) in " ".join(b)
     common = sum(1 for w in a if w in set(b))
     return common / len(a) >= threshold
+
+
+# Words a finished request almost never ends on: a pause after one of them is
+# a pause for thought, whatever the voice sounds like.
+DANGLING_WORDS = {
+    "a", "an", "the", "to", "of", "for", "with", "from", "into", "onto", "about",
+    "and", "or", "but", "nor", "because", "whether", "if", "than", "that", "so",
+    "my", "your", "our", "their", "its", "um", "uh", "erm", "er", "uhm", "hmm",
+}
+
+
+def ends_mid_sentence(text: str) -> bool:
+    """True when a (partial) transcript clearly stops in the middle of a thought."""
+    t = text.strip()
+    if not t:
+        return False
+    if t.endswith((",", "...", "…", "-", "—", ";", ":")):
+        return True
+    words = normalize_words(t)
+    return bool(words) and words[-1] in DANGLING_WORDS
 
 
 def is_hallucination(text: str) -> bool:
@@ -424,6 +453,95 @@ class ParakeetSTT:
         return str(self.model.recognize(audio, sample_rate=MIC_RATE)).strip()
 
 
+TURN_REPO = "pipecat-ai/smart-turn-v3"  # BSD 2-Clause
+TURN_FILE = "smart-turn-v3.2-cpu.onnx"  # int8, about 9 MB
+TURN_SECONDS = 8
+
+
+def _mel_filters(n_mels: int = 80, n_fft: int = 400, rate: int = MIC_RATE) -> np.ndarray:
+    """Slaney-style mel filter bank, as Whisper (and librosa) build it."""
+    def hz_to_mel(f):
+        f = np.asarray(f, dtype=np.float64)
+        lin = f / (200.0 / 3)
+        log = 15.0 + np.log(np.maximum(f, 1e-10) / 1000.0) / (np.log(6.4) / 27.0)
+        return np.where(f >= 1000.0, log, lin)
+
+    def mel_to_hz(m):
+        m = np.asarray(m, dtype=np.float64)
+        lin = m * (200.0 / 3)
+        log = 1000.0 * np.exp((np.log(6.4) / 27.0) * (m - 15.0))
+        return np.where(m >= 15.0, log, lin)
+
+    fft_freqs = np.linspace(0, rate / 2, n_fft // 2 + 1)
+    hz = mel_to_hz(np.linspace(hz_to_mel(0.0), hz_to_mel(rate / 2), n_mels + 2))
+    fdiff = np.diff(hz)
+    ramps = hz[:, None] - fft_freqs[None, :]
+    lower = -ramps[:-2] / fdiff[:-1, None]
+    upper = ramps[2:] / fdiff[1:, None]
+    weights = np.maximum(0.0, np.minimum(lower, upper))
+    weights *= (2.0 / (hz[2:] - hz[:-2]))[:, None]
+    return weights.astype(np.float32)
+
+
+_MEL = None
+
+
+def whisper_features(audio: np.ndarray, seconds: int = TURN_SECONDS) -> np.ndarray:
+    """Whisper log-mel features (80 x 100*seconds) of the last `seconds` of audio.
+
+    Shorter audio is zero-padded at the front, as Smart Turn was trained.
+    """
+    global _MEL
+    if _MEL is None:
+        _MEL = _mel_filters()
+    n = seconds * MIC_RATE
+    audio = np.asarray(audio, dtype=np.float32)[-n:]
+    if len(audio) < n:
+        audio = np.concatenate([np.zeros(n - len(audio), dtype=np.float32), audio])
+    audio = (audio - audio.mean()) / np.sqrt(audio.var() + 1e-7)
+    n_fft, hop = 400, 160
+    padded = np.pad(audio, n_fft // 2, mode="reflect")
+    frames = np.lib.stride_tricks.sliding_window_view(padded, n_fft)[::hop][:-1]
+    window = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+    power = np.abs(np.fft.rfft(frames * window, axis=1)) ** 2
+    mel = _MEL @ power.T.astype(np.float32)
+    log_spec = np.log10(np.maximum(mel, 1e-10))
+    log_spec = np.maximum(log_spec, log_spec.max() - 8.0)
+    return ((log_spec + 4.0) / 4.0).astype(np.float32)
+
+
+class SmartTurn:
+    """Pipecat's Smart Turn v3: from the sound alone, has the speaker finished?
+
+    A Whisper Tiny encoder with a small classifier head, int8 ONNX (9 MB):
+    from about 10 ms per call on a recent CPU to 80 ms on an older laptop
+    one. Returns the probability that the turn is complete.
+    """
+
+    def __init__(self, cfg: Config):
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+
+        folder = os.path.join(os.path.expanduser("~/.cache/voice-agent/models"), "smart-turn")
+        path = os.path.join(folder, TURN_FILE)
+        if not os.path.exists(path):
+            path = hf_hub_download(TURN_REPO, TURN_FILE, local_dir=folder)
+        so = ort.SessionOptions()
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        so.inter_op_num_threads = 1
+        # Two threads: it runs next to the transcription, which wants the rest.
+        so.intra_op_num_threads = 2
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self.session = ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
+        self.input = self.session.get_inputs()[0].name
+        self.predict(np.zeros(MIC_RATE, dtype=np.float32))  # warm up
+
+    def predict(self, audio: np.ndarray) -> float:
+        feats = whisper_features(audio)[None]
+        out = self.session.run(None, {self.input: feats})[0]
+        return float(np.asarray(out).reshape(-1)[0])
+
+
 class PhononTTS:
     def __init__(self, cfg: Config):
         import ptts
@@ -548,9 +666,20 @@ class Listener:
     def __init__(self, cfg: Config, vad: Callable[[bytes], bool],
                  on_utterance: Callable[[bytes, str, Optional[tuple[int, int]]], None],
                  is_speaking: Callable[[], bool], on_barge_in: Callable[[], None], on_hearing: Callable[[bool], None],
-                 on_pause: Callable[[bytes, tuple[int, int]], None] = lambda audio, key: None):
+                 on_pause: Callable[[bytes, tuple[int, int]], None] = lambda audio, key: None,
+                 turn: Optional[Callable[[np.ndarray], float]] = None, check_text: bool = False):
         self.cfg = cfg
         self.vad = vad
+        # Probability that the person has finished, from the audio so far.
+        self.turn = turn
+        # When the turn model says "finished", wait for the pause's early
+        # transcript (see turn_text) before ending, in case it dangles.
+        self.check_text = check_text
+        self.turn_sync = False  # tests run the model inline
+        # The pause being judged, and the answers for it as (key, verdict).
+        self.awaiting: Optional[tuple[int, int]] = None
+        self.turn_result: Optional[tuple[tuple[int, int], Optional[bool]]] = None
+        self.text_result: Optional[tuple[tuple[int, int], bool]] = None
         self.on_utterance = on_utterance
         self.on_pause = on_pause
         self.utterances = 0
@@ -633,21 +762,76 @@ class Listener:
         self.buf.append(frame)
         self.silence = 0 if voiced else self.silence + 1
         self.voiced += 1 if voiced else 0
+        if voiced:
+            self.awaiting = None
         too_long = len(self.buf) * FRAME_MS >= self.cfg.max_utterance_s * 1000
         speech_end = len(self.buf) - self.silence
         key = (self.utterances, speech_end)
         early = max(1, self.cfg.early_ms // FRAME_MS)
         if (self.silence == early and self.silence * FRAME_MS < self.cfg.silence_ms
                 and self.voiced * FRAME_MS >= self.cfg.min_utterance_ms):
-            self.on_pause(b"".join(self.buf), key)
-        if self.silence * FRAME_MS >= self.cfg.silence_ms or too_long:
+            audio = b"".join(self.buf)
+            self.on_pause(audio, key)
+            if self.turn is not None:
+                self.awaiting = key
+                self._ask_turn(audio, key)
+        if self.silence * FRAME_MS >= self._silence_limit(key) or too_long:
             audio = b"".join(self.buf)
             voiced_ms = self.voiced * FRAME_MS
             self._reset_vad()
             if voiced_ms >= self.cfg.min_utterance_ms:
                 self.on_utterance(audio, "voice", None if too_long else key)
 
+    # ---- end-of-turn detection
+    def _ask_turn(self, audio: bytes, key: tuple[int, int]) -> None:
+        """Run the turn model on the audio so far, off the mic thread.
+
+        It runs alongside the early transcription, which takes longer, so it
+        adds nothing to the wait for the transcript.
+        """
+        def run():
+            try:
+                started = time.perf_counter()
+                p = float(self.turn(np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0))
+                done = p >= self.cfg.turn_threshold
+                took = (time.perf_counter() - started) * 1000
+                log(f"turn {'complete' if done else 'incomplete'} (p={p:.2f}, {took:.0f} ms)", "debug")
+            except Exception as exc:
+                log(f"turn detection failed ({exc}); using a fixed pause", "warn")
+                done = None
+            self.turn_result = (key, done)
+
+        if self.turn_sync:
+            run()
+        else:
+            threading.Thread(target=run, daemon=True, name="turn").start()
+
+    def turn_text(self, key: tuple[int, int], text: str) -> None:
+        """The early transcript of the pause `key`: does it end mid-sentence?"""
+        self.text_result = (key, not ends_mid_sentence(text))
+
+    def _silence_limit(self, key: tuple[int, int]) -> int:
+        """How much silence ends the current pause."""
+        if self.turn is None or self.awaiting != key:
+            return self.cfg.silence_ms
+        longest = max(self.cfg.silence_ms, self.cfg.turn_max_silence_ms)
+        result, text = self.turn_result, self.text_result
+        if result is None or result[0] != key:
+            return longest  # the model has not answered yet: don't cut in
+        if result[1] is None:
+            return self.cfg.silence_ms  # the model failed: a fixed pause
+        if not result[1]:
+            return longest  # mid-thought: give them time
+        if not self.check_text:
+            return 0  # finished: end now
+        if text is None or text[0] != key:
+            # Finished, but the transcript is not in yet: end when it agrees,
+            # or after the usual pause.
+            return self.cfg.silence_ms
+        return 0 if text[1] else longest
+
     def _start(self, frame: Optional[bytes]) -> None:
+        self.awaiting = None
         self.in_speech = True
         self.utterances += 1
         self.silence = 0
@@ -675,7 +859,8 @@ class Ask:
 
 class Controller:
     def __init__(self, cfg: Config, stt, speaker_factory: Callable[["Controller"], Speaker],
-                 chime: Callable[[str], None] = lambda name: None):
+                 chime: Callable[[str], None] = lambda name: None,
+                 turn: Optional[Callable[[np.ndarray], float]] = None):
         self.cfg = cfg
         self.stt = stt
         self.chime = chime
@@ -694,7 +879,8 @@ class Controller:
         self.listener = Listener(cfg, vad=lambda f: False, on_utterance=self._on_utterance,
                                  is_speaking=lambda: self.speaker.speaking,
                                  on_barge_in=self._on_barge_in, on_hearing=self._on_hearing,
-                                 on_pause=self._on_pause)
+                                 on_pause=self._on_pause, turn=turn,
+                                 check_text=turn is not None and cfg.stt_language.startswith("en"))
         self._apply_mode()
         threading.Thread(target=self._transcribe_loop, daemon=True, name="stt").start()
 
@@ -809,6 +995,8 @@ class Controller:
                     self.early = (key, self._transcribe(audio))
                 except Exception:
                     self.early = (None, "")
+                    continue
+                self.listener.turn_text(key, self.early[1])
                 continue
             _, audio, source, during_speech, key = job
             self.transcribing += 1
@@ -1039,6 +1227,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         log(f"loading speech recognition ({resolve_stt_model(cfg.stt_model)}); the first run downloads it")
         stt = ParakeetSTT(cfg)
         log(f"speech recognition ready on the {stt.device.upper()}")
+        turn = None
+        if cfg.turn_detection:
+            try:
+                turn = SmartTurn(cfg).predict
+                log("turn detection ready (Smart Turn v3)")
+            except Exception as exc:
+                log(f"turn detection unavailable ({exc}); an utterance ends after {cfg.silence_ms} ms of silence", "warn")
         log("loading Phonon voice; the first run downloads it")
         tts = PhononTTS(cfg)
         import webrtcvad
@@ -1062,7 +1257,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if cfg.chimes and name in chimes:
             play_once(chime_argv, chimes[name])
 
-    ctl = Controller(cfg, stt, lambda c: Speaker(tts, Player(player_argv), c.on_speaking), chime=chime)
+    ctl = Controller(cfg, stt, lambda c: Speaker(tts, Player(player_argv), c.on_speaking), chime=chime, turn=turn)
     ctl.listener.vad = lambda frame: vad_engine.is_speech(frame, MIC_RATE)
 
     take_over_socket(args.socket)
