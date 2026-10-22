@@ -4,7 +4,7 @@ Talk with Claude Code out loud, like talking to a colleague. You discuss a task,
 
 All the speech runs on your own machine:
 
-- **Hearing:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (Whisper, int8 on the CPU) with WebRTC voice detection.
+- **Hearing:** NVIDIA [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) through [onnx-asr](https://github.com/istupakov/onnx-asr), on an NVIDIA GPU when there is one, else int8 on the CPU, with WebRTC voice detection. It transcribes during the pause at the end of what you say, so the text is usually ready the moment the pause is long enough to count as the end (about 0.4 s after you stop on a laptop CPU).
 - **Speaking:** [Phonon](https://gradium.ai/phonon) 31m by Gradium: open weights (Apache 2.0), about 65 MB, streams audio while it generates.
 - **Audio:** PipeWire/PulseAudio (`parecord`/`paplay`), falling back to ALSA (`arecord`/`aplay`).
 
@@ -13,7 +13,7 @@ It is built and tested for Linux, Omarchy (Arch + Hyprland + PipeWire) in partic
 ## How it works
 
 ```
- you ─► mic ─► voice detection ─► Whisper ─► "hey Claude, add dark mode"
+ you ─► mic ─► voice detection ─► Parakeet ─► "hey Claude, add dark mode"
                                                   │
                                                   ▼
                                    Claude, the partner (talks, plans, asks)
@@ -50,7 +50,7 @@ Push-to-talk works in every mode. Switch modes with `/talk mode natural`, the **
 sudo pacman -S --needed uv curl pipewire-pulse
 ```
 
-`uv` runs the voice helper and installs its Python dependencies (faster-whisper, ptts, webrtcvad, numpy) into its own cache on first start. Nothing is installed system-wide.
+`uv` runs the voice helper and installs its Python dependencies (onnx-asr with onnxruntime, ptts, webrtcvad, numpy) into its own cache on first start. Nothing is installed system-wide.
 
 ### 2. The mod
 
@@ -74,7 +74,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 /talk on
 ```
 
-The first start downloads the Whisper model (about 145 MB for `base.en`) and Phonon 31m (about 65 MB) from Hugging Face, which takes a minute. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
+The first start downloads the Parakeet model (about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB) and Phonon 31m (about 65 MB) from Hugging Face, which takes a minute. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
 
 ### 4. Push-to-talk key (Hyprland)
 
@@ -117,8 +117,9 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | --- | --- | --- |
 | Listening mode | `wake` | `wake`, `natural` or `ptt` |
 | Wake word | `hey claude` | Matched loosely: "hey cloud" and "hey Clyde" also count |
-| Speech recognition model | `base.en` | `tiny.en` is fastest, `small.en` most accurate |
-| Language | `en` | Other languages need a multilingual Phonon 40m model and a Whisper model without `.en` |
+| Speech recognition model | `parakeet-v2` | English; `parakeet-v3` covers 25 European languages |
+| Speech recognition device | `auto` | An NVIDIA GPU when there is one, else the CPU. `cpu` skips the GPU download |
+| Language | `en` | Other languages need a multilingual Phonon 40m model and `parakeet-v3` |
 | Phonon voice model | Phonon 31m | e.g. `hf://gradium/phonon-40m-en` (non-commercial license, gated: accept its terms on Hugging Face, then `hf auth login`) |
 | Voice | model default | List voices with `uvx ptts --list-voices` |
 | Interrupt by talking | on | |
@@ -150,7 +151,7 @@ Then `systemctl --user restart pipewire` and pick "Echo-cancelled mic" as the de
 
 ## Troubleshooting
 
-- **"could not start the voice helper"**: install `uv` (`sudo pacman -S uv`). Or point the **Voice helper command** setting at your own Python environment, e.g. `~/.venvs/voice/bin/python /path/to/helper/voice_helper.py`, after `pip install numpy faster-whisper ptts webrtcvad-wheels`.
+- **"could not start the voice helper"**: install `uv` (`sudo pacman -S uv`). Or point the **Voice helper command** setting at your own Python environment, e.g. `~/.venvs/voice/bin/python /path/to/helper/voice_helper.py`, after `pip install numpy 'onnx-asr[cpu,hub]' ptts webrtcvad-wheels` (for the GPU, `onnxruntime-gpu[cuda,cudnn]` in place of `onnxruntime`).
 - **"no recorder found"**: install `pipewire-pulse` (it provides `parecord`/`paplay`) or `alsa-utils`.
 - **It doesn't react to "hey Claude"**: try `small.en`, speak a little slower, or set your own wake word. `/talk status` shows the last notice.
 - **Model downloads fail**: they come from huggingface.co, so check that it's reachable. The 40m Phonon models also need `hf auth login`.
@@ -172,7 +173,7 @@ Layout:
 - `hooks/register.tsx`: the mod. Starts the helper, streams speech, runs the partner prompt, the `delegate_task` and `list_tasks` tools, voice permissions, `/talk` and the Voice pane.
 - `hooks/speech.ts`: sentence splitting, markdown-to-speech, spoken commands, permission wording.
 - `hooks/prompts.ts`: what the model reads.
-- `helper/voice_helper.py`: the local voice process: mic, voice detection, wake word, push-to-talk, Whisper, Phonon, barge-in and spoken yes/no questions, controlled over a Unix socket.
+- `helper/voice_helper.py`: the local voice process: mic, voice detection, wake word, push-to-talk, Parakeet, Phonon, barge-in and spoken yes/no questions, controlled over a Unix socket.
 
 ## License
 

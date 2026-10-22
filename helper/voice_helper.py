@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #   "numpy>=1.26",
-#   "faster-whisper>=1.1",
+#   "onnx-asr[cpu,hub]>=0.12",
 #   "ptts>=0.4",
 #   "webrtcvad-wheels>=2.0.14",
 # ]
@@ -12,7 +12,8 @@
 
 Everything runs on this machine: the microphone is read through PipeWire /
 PulseAudio / ALSA command-line tools, speech is detected with WebRTC VAD,
-transcribed with faster-whisper and spoken with Phonon (ptts).
+transcribed with NVIDIA Parakeet (onnx-asr; on the GPU when there is an
+NVIDIA one) and spoken with Phonon (ptts).
 
 The mod starts this process and reads newline-delimited JSON events from its
 stdout. It sends commands over HTTP on a Unix socket (``--socket``), which is
@@ -61,6 +62,16 @@ FRAME_BYTES = FRAME_SAMPLES * 2
 
 MODES = ("natural", "wake", "ptt")
 
+DEFAULT_STT_MODEL = "nemo-parakeet-tdt-0.6b-v2"
+# onnx-asr model name -> Hugging Face repo with its ONNX export.
+STT_MODELS = {
+    "nemo-parakeet-tdt-0.6b-v2": "istupakov/parakeet-tdt-0.6b-v2-onnx",  # English
+    "nemo-parakeet-tdt-0.6b-v3": "istupakov/parakeet-tdt-0.6b-v3-onnx",  # 25 European languages
+}
+STT_ALIASES = {"parakeet": DEFAULT_STT_MODEL, "parakeet-v2": DEFAULT_STT_MODEL,
+               "parakeet-v3": "nemo-parakeet-tdt-0.6b-v3"}
+GPU_RUNTIME = "onnxruntime-gpu[cuda,cudnn]>=1.20"
+
 YES_WORDS = {
     "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "allow", "approve",
     "approved", "fine", "alright", "affirmative", "correct", "absolutely",
@@ -73,7 +84,7 @@ NO_WORDS = {
 }
 NO_PHRASES = ("do not", "not now", "hold on", "hang on", "not yet", "no way")
 
-# Things Whisper likes to "hear" in silence or noise.
+# Things a recognizer may "hear" in silence or noise.
 HALLUCINATIONS = {
     "", "you", "thank you", "thanks", "thank you.", "bye", "bye.", "okay.",
     "thanks for watching", "thank you for watching", "subtitles by the amara.org community",
@@ -91,9 +102,10 @@ class Config:
     wake_aliases: list[str] = field(default_factory=lambda: ["hey cloud", "hey clyde", "hi claude", "okay claude"])
     wake_threshold: float = 0.75
     follow_up_s: float = 8.0
-    stt_model: str = "base.en"
+    stt_model: str = DEFAULT_STT_MODEL
     stt_language: str = "en"
-    stt_threads: int = 0
+    stt_device: str = "auto"  # auto | cuda | cpu
+    stt_quant: str = ""  # "" picks int8 on the CPU, full precision on the GPU
     tts_model: str = ""
     tts_voice: str = ""
     tts_lang: str = "en"
@@ -101,7 +113,10 @@ class Config:
     barge_in: bool = True
     barge_in_rms: float = 0.03
     barge_in_ms: int = 300
-    silence_ms: int = 700
+    silence_ms: int = 500
+    # Transcribe this far into a pause, so the text is ready when the pause
+    # turns out to be the end of the utterance.
+    early_ms: int = 150
     min_utterance_ms: int = 350
     max_utterance_s: float = 30.0
     vad_aggressiveness: int = 2
@@ -352,32 +367,61 @@ def play_once(argv: list[str], data: bytes) -> None:
 # Engines (loaded lazily so tests can swap them)
 
 
-class WhisperSTT:
+def resolve_stt_model(name: str) -> str:
+    name = (name or "").strip()
+    name = STT_ALIASES.get(name, name)
+    if name not in STT_MODELS:
+        if name:
+            log(f"unknown speech recognition model {name!r}; using {DEFAULT_STT_MODEL}", "warn")
+        return DEFAULT_STT_MODEL
+    return name
+
+
+def cuda_available() -> bool:
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        return False
+    return "CUDAExecutionProvider" in ort.get_available_providers()
+
+
+class ParakeetSTT:
+    """NVIDIA Parakeet TDT through onnx-asr: fast, and quiet on silence."""
+
     def __init__(self, cfg: Config):
-        from faster_whisper import WhisperModel
+        import onnx_asr
+        from huggingface_hub import snapshot_download
 
         self.cfg = cfg
-        self.model = WhisperModel(cfg.stt_model, device="cpu", compute_type="int8", cpu_threads=cfg.stt_threads)
-        hot = [w for w in normalize_words(cfg.wake_word) if w not in ("hey", "hi", "ok", "okay")]
-        self.hotwords = " ".join(w.capitalize() for w in hot) or None
+        self.name = name = resolve_stt_model(cfg.stt_model)
+        # A plain folder rather than the hub cache: newer onnxruntime refuses
+        # external weight files that sit behind the cache's symlinks.
+        folder = os.path.join(os.path.expanduser("~/.cache/voice-agent/models"), name)
+
+        def load(quant: str, providers: list[str]):
+            stem = f"*.{quant}.onnx" if quant else "*-model.onnx*"
+            snapshot_download(STT_MODELS[name], local_dir=folder,
+                              allow_patterns=[stem, "nemo*.onnx", "vocab.txt", "config.json"])
+            return onnx_asr.load_model(name, folder, quantization=quant or None, providers=providers)
+
+        self.model = None
+        if cfg.stt_device != "cpu" and cuda_available():
+            try:
+                import onnxruntime as ort
+
+                ort.preload_dlls()
+                # Full precision: int8 kernels mostly run on the CPU anyway.
+                self.model = load(cfg.stt_quant, ["CUDAExecutionProvider", "CPUExecutionProvider"])
+                self.device = "gpu"
+            except Exception as exc:
+                log(f"speech recognition on the GPU failed ({exc}); using the CPU", "warn")
+        if self.model is None:
+            self.model = load(cfg.stt_quant or "int8", ["CPUExecutionProvider"])
+            self.device = "cpu"
+        self.model.recognize(np.zeros(MIC_RATE // 2, dtype=np.float32), sample_rate=MIC_RATE)  # warm up
 
     def transcribe(self, audio: np.ndarray) -> str:
-        language = self.cfg.stt_language or None
-        if self.cfg.stt_model.endswith(".en"):
-            language = "en"
-        segments, _info = self.model.transcribe(
-            audio,
-            language=language,
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            vad_filter=False,
-            without_timestamps=True,
-            hotwords=self.hotwords,
-        )
-        parts = [s.text for s in segments if s.no_speech_prob < 0.6]
-        return " ".join(p.strip() for p in parts).strip()
+        return str(self.model.recognize(audio, sample_rate=MIC_RATE)).strip()
 
 
 class PhononTTS:
@@ -494,13 +538,22 @@ class Listener:
 
     Hands-free capture uses the VAD; push-to-talk captures everything between
     down and up (plus a little audio from just before the key went down).
+
+    A short pause mid-utterance calls on_pause with the audio so far, keyed by
+    (utterance number, frames up to the pause). If the pause runs on into the
+    end of the utterance, on_utterance gets the same key, so a transcript made
+    during the pause can be used as is.
     """
 
-    def __init__(self, cfg: Config, vad: Callable[[bytes], bool], on_utterance: Callable[[bytes, str], None],
-                 is_speaking: Callable[[], bool], on_barge_in: Callable[[], None], on_hearing: Callable[[bool], None]):
+    def __init__(self, cfg: Config, vad: Callable[[bytes], bool],
+                 on_utterance: Callable[[bytes, str, Optional[tuple[int, int]]], None],
+                 is_speaking: Callable[[], bool], on_barge_in: Callable[[], None], on_hearing: Callable[[bool], None],
+                 on_pause: Callable[[bytes, tuple[int, int]], None] = lambda audio, key: None):
         self.cfg = cfg
         self.vad = vad
         self.on_utterance = on_utterance
+        self.on_pause = on_pause
+        self.utterances = 0
         self.is_speaking = is_speaking
         self.on_barge_in = on_barge_in
         self.on_hearing = on_hearing
@@ -533,7 +586,7 @@ class Listener:
             audio = b"".join(self.ptt_buf)
             self.ptt_buf = []
         if len(audio) >= FRAME_BYTES * (self.cfg.min_utterance_ms // FRAME_MS):
-            self.on_utterance(audio, "ptt")
+            self.on_utterance(audio, "ptt", None)
 
     def _reset_vad(self) -> None:
         if self.in_speech:
@@ -581,15 +634,22 @@ class Listener:
         self.silence = 0 if voiced else self.silence + 1
         self.voiced += 1 if voiced else 0
         too_long = len(self.buf) * FRAME_MS >= self.cfg.max_utterance_s * 1000
+        speech_end = len(self.buf) - self.silence
+        key = (self.utterances, speech_end)
+        early = max(1, self.cfg.early_ms // FRAME_MS)
+        if (self.silence == early and self.silence * FRAME_MS < self.cfg.silence_ms
+                and self.voiced * FRAME_MS >= self.cfg.min_utterance_ms):
+            self.on_pause(b"".join(self.buf), key)
         if self.silence * FRAME_MS >= self.cfg.silence_ms or too_long:
             audio = b"".join(self.buf)
             voiced_ms = self.voiced * FRAME_MS
             self._reset_vad()
             if voiced_ms >= self.cfg.min_utterance_ms:
-                self.on_utterance(audio, "voice")
+                self.on_utterance(audio, "voice", None if too_long else key)
 
     def _start(self, frame: Optional[bytes]) -> None:
         self.in_speech = True
+        self.utterances += 1
         self.silence = 0
         self.voiced = max(1, sum(self.window))
         self.buf = list(self.preroll)
@@ -627,11 +687,14 @@ class Controller:
         self.state = "idle"
         self.hearing = False
         self.transcribing = 0
-        self.jobs: "queue.Queue[tuple[bytes, str, bool]]" = queue.Queue()
+        # ("final", audio, source, during_speech, key) or ("early", audio, key)
+        self.jobs: "queue.Queue[tuple]" = queue.Queue()
+        self.early: tuple[Optional[tuple[int, int]], str] = (None, "")
         self.speaker = speaker_factory(self)
         self.listener = Listener(cfg, vad=lambda f: False, on_utterance=self._on_utterance,
                                  is_speaking=lambda: self.speaker.speaking,
-                                 on_barge_in=self._on_barge_in, on_hearing=self._on_hearing)
+                                 on_barge_in=self._on_barge_in, on_hearing=self._on_hearing,
+                                 on_pause=self._on_pause)
         self._apply_mode()
         threading.Thread(target=self._transcribe_loop, daemon=True, name="stt").start()
 
@@ -707,8 +770,12 @@ class Controller:
         self.speaker.stop()
         emit("barge_in")
 
-    def _on_utterance(self, audio: bytes, source: str) -> None:
-        self.jobs.put((audio, source, self.speaker.speaking or time.monotonic() - self.speaker.last_end < 0.6))
+    def _on_utterance(self, audio: bytes, source: str, key: Optional[tuple[int, int]] = None) -> None:
+        during_speech = self.speaker.speaking or time.monotonic() - self.speaker.last_end < 0.6
+        self.jobs.put(("final", audio, source, during_speech, key))
+
+    def _on_pause(self, audio: bytes, key: tuple[int, int]) -> None:
+        self.jobs.put(("early", audio, key))
 
     # ---- push-to-talk
     def ptt(self, action: str) -> None:
@@ -727,19 +794,37 @@ class Controller:
         self._publish()
 
     # ---- transcription
+    def _transcribe(self, audio: bytes) -> str:
+        pcm = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
+        return self.stt.transcribe(pcm)
+
     def _transcribe_loop(self) -> None:
         while True:
-            audio, source, during_speech = self.jobs.get()
+            job = self.jobs.get()
+            if job[0] == "early":
+                _, audio, key = job
+                if not self.jobs.empty():
+                    continue  # stale already: the final one is waiting
+                try:
+                    self.early = (key, self._transcribe(audio))
+                except Exception:
+                    self.early = (None, "")
+                continue
+            _, audio, source, during_speech, key = job
             self.transcribing += 1
             self._publish()
             try:
-                pcm = np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0
-                text = self.stt.transcribe(pcm)
+                early_key, early_text = self.early
+                if key is not None and key == early_key:
+                    text = early_text
+                else:
+                    text = self._transcribe(audio)
             except Exception as exc:
                 emit("error", msg=f"transcription failed: {exc}")
                 text = ""
             finally:
                 self.transcribing -= 1
+                self.early = (None, "")
             try:
                 self.handle_text(text, source, during_speech)
             except Exception as exc:
@@ -951,8 +1036,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     try:
         emit("state", state="loading", mode=cfg.mode, muted=False, awake=False, asking=False, ptt=False)
-        log(f"loading speech recognition ({cfg.stt_model}); the first run downloads it")
-        stt = WhisperSTT(cfg)
+        log(f"loading speech recognition ({resolve_stt_model(cfg.stt_model)}); the first run downloads it")
+        stt = ParakeetSTT(cfg)
+        log(f"speech recognition ready on the {stt.device.upper()}")
         log("loading Phonon voice; the first run downloads it")
         tts = PhononTTS(cfg)
         import webrtcvad
@@ -1033,5 +1119,38 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
+def relaunch_on_gpu() -> None:
+    """Re-run this script under uv with the CUDA build of onnxruntime layered on.
+
+    Only for an NVIDIA machine without it: the first time, uv downloads the
+    CUDA runtime (about 2 GB). If anything goes wrong, carry on on the CPU.
+    """
+    uv = shutil.which("uv")
+    if not uv or not shutil.which("nvidia-smi") or os.environ.get("VOICE_AGENT_GPU") or cuda_available():
+        return
+    cmd = [uv, "run", "--quiet", "--with", GPU_RUNTIME, "--script", os.path.abspath(__file__)]
+    env = {**os.environ, "VOICE_AGENT_GPU": "1"}
+    log("setting up GPU speech recognition; the first run downloads the CUDA runtime (about 2 GB)")
+    try:
+        probe = subprocess.run([*cmd, "--check-gpu"], env=env, capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"no GPU runtime ({exc}); using the CPU", "warn")
+        return
+    if probe.returncode != 0 or "cuda" not in probe.stdout:
+        log(f"no GPU runtime ({(probe.stderr or probe.stdout).strip()[-200:]}); using the CPU", "warn")
+        return
+    sys.stdout.flush()
+    os.execvpe(uv, [*cmd, *sys.argv[1:]], env)
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-gpu"]:
+        print("cuda" if cuda_available() else "cpu")
+        sys.exit(0)
+    _ap = argparse.ArgumentParser(add_help=False)
+    _ap.add_argument("--config", default="{}")
+    _cfg = Config.from_json(_ap.parse_known_args()[0].config)
+    if _cfg.stt_device != "cpu":
+        emit("state", state="loading", mode=_cfg.mode, muted=False, awake=False, asking=False, ptt=False)
+        relaunch_on_gpu()
     sys.exit(main())

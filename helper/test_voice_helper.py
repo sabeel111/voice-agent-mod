@@ -92,8 +92,10 @@ class ScriptedSTT:
 
     def __init__(self):
         self.texts: list[str] = []
+        self.calls = 0
 
     def transcribe(self, audio):
+        self.calls += 1
         return self.texts.pop(0) if self.texts else ""
 
 
@@ -169,6 +171,31 @@ def test_hallucinations_are_dropped():
     assert not vh.is_hallucination("run the tests")
 
 
+def test_stt_model_names():
+    assert vh.resolve_stt_model("") == vh.DEFAULT_STT_MODEL
+    assert vh.resolve_stt_model("parakeet-v3") == "nemo-parakeet-tdt-0.6b-v3"
+    assert vh.resolve_stt_model("base.en") == vh.DEFAULT_STT_MODEL  # an old Whisper setting
+
+
+def test_early_transcript_is_reused_when_the_pause_ends_the_utterance(events):
+    ctl, stt, *_ = make_controller("natural")
+    stt.texts = ["add a test"]
+    ctl._on_pause(b"\0\0" * 1600, (1, 40))
+    wait_until(lambda: ctl.early[0] == (1, 40))
+    ctl._on_utterance(b"\0\0" * 3200, "voice", (1, 40))
+    assert events.wait_for("transcript")[0]["text"] == "add a test"
+    assert stt.calls == 1
+
+
+def test_early_transcript_is_dropped_when_speech_went_on(events):
+    ctl, stt, *_ = make_controller("natural")
+    stt.texts = ["add a", "add a test please"]
+    ctl._on_pause(b"\0\0" * 1600, (1, 40))
+    wait_until(lambda: stt.calls == 1)
+    ctl._on_utterance(b"\0\0" * 3200, "voice", (1, 70))
+    assert events.wait_for("transcript")[0]["text"] == "add a test please"
+
+
 def test_config_from_json_ignores_unknown_and_bad_mode():
     cfg = vh.Config.from_json(json.dumps({"mode": "bogus", "wake_word": "hey jarvis", "nope": 1, "tts_voice": ""}))
     assert cfg.mode == "wake"
@@ -193,19 +220,46 @@ def silent_frame():
     return np.zeros(vh.FRAME_SAMPLES, dtype=np.int16).tobytes()
 
 
-def make_listener(mode="natural", speaking=lambda: False):
+def make_listener(mode="natural", speaking=lambda: False, pauses=None):
     got: list[tuple[int, str]] = []
     barge: list[int] = []
-    cfg = vh.Config(mode=mode, silence_ms=300, min_utterance_ms=200)
+    cfg = vh.Config(mode=mode, silence_ms=300, early_ms=90, min_utterance_ms=200)
     lis = vh.Listener(
         cfg,
         vad=lambda f: vh.rms(f) > 0.01,
-        on_utterance=lambda audio, src: got.append((len(audio), src)),
+        on_utterance=lambda audio, src, key: got.append((len(audio), src, key)),
         is_speaking=speaking,
         on_barge_in=lambda: barge.append(1),
         on_hearing=lambda h: None,
+        on_pause=(lambda audio, key: pauses.append(key)) if pauses is not None else (lambda audio, key: None),
     )
     return lis, got, barge
+
+
+def test_listener_pause_key_matches_the_utterance_that_follows():
+    pauses: list = []
+    lis, got, _ = make_listener(pauses=pauses)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    for _ in range(15):
+        lis.feed(silent_frame())
+    assert len(pauses) == 1 and len(got) == 1
+    assert got[0][2] == pauses[0]
+
+
+def test_listener_resumed_speech_gets_a_new_pause_key():
+    pauses: list = []
+    lis, got, _ = make_listener(pauses=pauses)
+    for _ in range(30):
+        lis.feed(voiced_frame())
+    for _ in range(5):  # a short pause, then more words
+        lis.feed(silent_frame())
+    for _ in range(20):
+        lis.feed(voiced_frame())
+    for _ in range(15):
+        lis.feed(silent_frame())
+    assert len(pauses) == 2 and len(got) == 1
+    assert got[0][2] == pauses[1] != pauses[0]
 
 
 def test_listener_segments_an_utterance():
@@ -491,7 +545,7 @@ def test_take_over_socket_stops_the_other_helper(server):
 def test_main_end_to_end(events, monkeypatch):
     stt = ScriptedSTT()
     stt.texts = ["Hey Claude, what's the plan?"]
-    monkeypatch.setattr(vh, "WhisperSTT", lambda cfg: stt)
+    monkeypatch.setattr(vh, "ParakeetSTT", lambda cfg: setattr(stt, "device", "cpu") or stt)
     monkeypatch.setattr(vh, "PhononTTS", lambda cfg: FakeTTS())
     tmp = tempfile.mkdtemp()
     sock = os.path.join(tmp, "v.sock")

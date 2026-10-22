@@ -1,7 +1,7 @@
 {
   "name": "voice-agent",
   "version": "0.1.0",
-  "description": "Talk with Claude out loud, fully local: Whisper hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
+  "description": "Talk with Claude out loud, fully local: Parakeet hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
   "author": {
     "name": "sabeel111"
   },
@@ -12,7 +12,7 @@
     "speech",
     "tts",
     "stt",
-    "whisper",
+    "parakeet",
     "phonon",
     "hyprland",
     "agents"
@@ -45,17 +45,21 @@
     "sttModel": {
       "type": "string",
       "title": "Speech recognition model",
-      "description": "faster-whisper model. tiny.en is fastest, small.en is most accurate; use a model without .en for other languages.",
-      "default": "base.en",
+      "description": "NVIDIA Parakeet model. parakeet-v2 is English; parakeet-v3 covers 25 European languages.",
+      "default": "parakeet-v2",
       "options": [
-        "tiny.en",
-        "base.en",
-        "small.en",
-        "distil-small.en",
-        "tiny",
-        "base",
-        "small",
-        "large-v3-turbo"
+        "parakeet-v2",
+        "parakeet-v3"
+      ]
+    },
+    "sttDevice": {
+      "type": "string",
+      "title": "Speech recognition device",
+      "description": "auto uses an NVIDIA GPU when there is one (the first start downloads the CUDA runtime, about 2 GB, and the full model, about 2.4 GB), else the CPU.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "cpu"
       ]
     },
     "language": {

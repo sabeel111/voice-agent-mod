@@ -8,7 +8,7 @@
     {
       "name": "voice-agent",
       "source": "./",
-      "description": "Talk with Claude out loud, fully local: Whisper hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking."
+      "description": "Talk with Claude out loud, fully local: Parakeet hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking."
     }
   ]
 }

@@ -167,6 +167,7 @@ export const register: Register = (on, options) => {
         mode,
         wake_word: opt.wakeWord,
         stt_model: opt.sttModel,
+        stt_device: opt.sttDevice,
         stt_language: opt.language,
         tts_model: opt.ttsModel,
         tts_voice: opt.ttsVoice,
@@ -508,6 +509,7 @@ type Options = {
   mode: VoiceMode
   wakeWord: string
   sttModel: string
+  sttDevice: string
   language: string
   ttsModel: string
   ttsVoice: string
@@ -533,7 +535,8 @@ function readOptions(o: PluginOptions): Options {
     autoStart: bool('autoStart', false),
     mode: mode === 'natural' || mode === 'ptt' ? mode : 'wake',
     wakeWord: str('wakeWord') || 'hey claude',
-    sttModel: str('sttModel') || 'base.en',
+    sttModel: str('sttModel') || 'parakeet-v2',
+    sttDevice: str('sttDevice') || 'auto',
     language: str('language') || 'en',
     ttsModel: str('ttsModel'),
     ttsVoice: str('ttsVoice'),
