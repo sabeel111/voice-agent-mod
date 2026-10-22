@@ -1,6 +1,6 @@
 {
   "name": "voice-agent",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Talk with Claude out loud, fully local: Parakeet hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
   "author": {
     "name": "sabeel111"
@@ -65,7 +65,7 @@
     "turnDetection": {
       "type": "boolean",
       "title": "Smart end-of-turn detection",
-      "description": "A small audio model (Smart Turn v3, 9 MB) tells when you have finished: Claude answers as soon as you sound done and waits through pauses mid-sentence. Off: a fixed half-second pause ends what you say.",
+      "description": "A small audio model (Smart Turn v3, 9 MB) tells when you have finished: Claude answers as soon as you sound done and waits through pauses mid-sentence. Off: a fixed pause ends what you say (see Pause that ends your turn).",
       "default": true
     },
     "vadStrictness": {
@@ -91,6 +91,12 @@
       "title": "Minimum loudness over background",
       "description": "How many times louder than the background noise speech must be. Higher ignores more background voices; 0 turns it off.",
       "default": 2
+    },
+    "pauseMs": {
+      "type": "number",
+      "title": "Pause that ends your turn (ms)",
+      "description": "How long a silence means you've finished talking. Longer lets you pause mid-sentence; shorter replies sooner. Used when turn detection is off.",
+      "default": 800
     },
     "language": {
       "type": "string",

@@ -120,7 +120,7 @@ class Config:
     loudness_ratio: float = 2.0
     # Without turn detection (or when its model fails to load), an utterance
     # ends after this much silence.
-    silence_ms: int = 500
+    silence_ms: int = 800
     # Transcribe this far into a pause, so the text is ready when the pause
     # turns out to be the end of the utterance. The turn model also runs here.
     early_ms: int = 150

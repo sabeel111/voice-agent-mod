@@ -120,10 +120,11 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | Wake word | `hey claude` | Matched loosely: "hey cloud" and "hey Clyde" also count |
 | Speech recognition model | `parakeet-v2` | English; `parakeet-v3` covers 25 European languages |
 | Speech recognition device | `auto` | An NVIDIA GPU when there is one, else the CPU. `cpu` skips the GPU download |
-| Smart end-of-turn detection | on | Answer as soon as you sound finished; wait through pauses mid-sentence. Off: a fixed 0.5 s pause ends what you say |
+| Smart end-of-turn detection | on | Answer as soon as you sound finished; wait through pauses mid-sentence. Off: a fixed pause ends what you say (see below) |
 | Voice detection strictness | `3` | `0` to `3`. Higher ignores more background noise but may miss very quiet speech |
 | Minimum speech length (ms) | 500 | Shorter sounds are ignored |
 | Minimum loudness over background | 2 | How many times louder than the background noise speech must be. Higher ignores more background voices; `0` turns it off |
+| Pause that ends your turn (ms) | 800 | How long a silence means you've finished talking. Longer lets you pause mid-sentence; shorter replies sooner. Used when turn detection is off |
 | Language | `en` | Other languages need a multilingual Phonon 40m model and `parakeet-v3` |
 | Phonon voice model | Phonon 31m | e.g. `hf://gradium/phonon-40m-en` (non-commercial license, gated: accept its terms on Hugging Face, then `hf auth login`) |
 | Voice | model default | List voices with `uvx ptts --list-voices` |
@@ -150,7 +151,7 @@ Then:
 | finished (p ≥ 0.5) | does not stop on "the", "and", "um", a comma… | as soon as the transcript is in, usually 0.2 to 0.3 s into the pause |
 | finished | stops mid-sentence | after 1.2 s of silence |
 | not finished | | after 1.2 s of silence |
-| model unavailable | | after 0.5 s of silence (the old fixed pause) |
+| model unavailable | | after the fixed pause (0.8 s by default) |
 
 Speaking again during the pause starts over, so a pause for thought never sends half a sentence. The transcript check is for English only; other languages rely on Smart Turn alone.
 
