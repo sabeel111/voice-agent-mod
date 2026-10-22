@@ -1,6 +1,6 @@
 {
   "name": "voice-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Talk with Claude out loud, fully local: Parakeet hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
   "author": {
     "name": "sabeel111"
