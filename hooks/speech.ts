@@ -161,14 +161,39 @@ export function modeLabel(mode: VoiceMode): string {
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n).trimEnd()}…` : s)
 const base = (p: string) => p.split('/').filter(Boolean).at(-1) ?? p
 
-/** "run the command npm test", "edit login.ts", ... */
+/** The program a shell command runs, e.g. "git" for "cd repo && FOO=1 sudo git push". */
+export function commandProgram(command: string): string | undefined {
+  for (const segment of command.split(/&&|\|\||;|\n/)) {
+    const words = segment.trim().replace(/^[({]\s*/, '').split(/\s+/).filter(Boolean)
+    while (words.length > 0 && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || /^(?:sudo|env|time|nohup|exec|command)$/.test(words[0]!))) {
+      words.shift()
+    }
+    const first = words[0]
+    if (first === undefined || /^(?:cd|pushd|popd|export|set|source|\.)$/.test(first)) continue
+    const name = base(first)
+    return /^[A-Za-z][A-Za-z0-9._+-]{0,29}$/.test(name) ? name : undefined
+  }
+  return undefined
+}
+
+/** A shell command, said without reading it out: the agent's own description, or just the program. */
+function describeCommand(description: string, command: string, shell: string): string {
+  const d = description.replace(/\s+/g, ' ').trim().replace(/[.\s]+$/, '')
+  // "Run the tests" reads as "wants to run the tests"; acronyms like "NPM" keep their case.
+  if (d) return clip(/^[A-Z][a-z]/.test(d) ? d.charAt(0).toLowerCase() + d.slice(1) : d, 100)
+  const program = commandProgram(command)
+  if (program === undefined) return `run a ${shell} command`
+  return `run ${/^[aeio]/i.test(program) ? 'an' : 'a'} ${program} command`
+}
+
+/** "find the failing test", "run a git command", "edit login.ts", ... Never reads a command out. */
 export function describeToolCall(tool: string, input: unknown): string {
   const i = (input ?? {}) as Record<string, unknown>
   const str = (k: string) => (typeof i[k] === 'string' ? (i[k] as string) : '')
   switch (tool) {
     case 'Bash':
     case 'PowerShell':
-      return `run the command: ${clip(str('command').replace(/\s+/g, ' '), 120)}`
+      return describeCommand(str('description'), str('command'), tool === 'PowerShell' ? 'PowerShell' : 'shell')
     case 'Edit':
     case 'MultiEdit':
       return `edit ${base(str('file_path'))}`

@@ -30,7 +30,7 @@ It is built and tested for Linux, Omarchy (Arch + Hyprland + PipeWire) in partic
 - **Background agents.** `delegate_task` starts a background subagent and returns at once, so the conversation continues. Several can run at once. Ask "how's it going?" and Claude calls `list_tasks`, which shows each agent's latest activity. When an agent finishes, its report goes back to the partner, which summarizes it out loud.
 - **Streaming speech.** Replies are read sentence by sentence as they stream in, so Claude starts talking before it has finished writing. Code blocks are not read out ("I've put the code on screen").
 - **Barge-in.** Talk over Claude and it stops. Say "stop" to silence it.
-- **Permissions by voice.** When Claude or an agent needs permission, you hear "The dark mode agent wants to run the command npm test. Is that okay?" Answer yes or no. If you don't answer, the normal permission prompt appears.
+- **Permissions by voice.** When Claude or an agent needs permission, you hear "The dark mode agent wants to run the unit tests. Is that okay?" Shell commands are never read out: you hear the short description Claude gave the command, or, without one, just the program ("wants to run a git command"). Answer yes or no. If you don't answer, the normal permission prompt appears.
 
 ## Listening modes
 

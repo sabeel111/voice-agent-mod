@@ -190,9 +190,9 @@ test('a permission prompt is asked out loud and answered by voice', async ($, on
   on('tool.check', () => ({ decision: 'ask' as const }))
   await voiceOn($, w)
   await sleep(20)
-  const yes = await $.tool.check({ tool: 'Bash', input: { command: 'npm test' }, tool_use_id: 'tu1' })
+  const yes = await $.tool.check({ tool: 'Bash', input: { command: 'npm test', description: 'Run the tests' }, tool_use_id: 'tu1' })
   expect(yes.decision).toBe('allow')
-  expect(w.fetches.find(f => f.path === '/ask')?.body.question).toBe('I want to run the command: npm test. Is that okay?')
+  expect(w.fetches.find(f => f.path === '/ask')?.body.question).toBe('I want to run the tests. Is that okay?')
   w.askAnswer = 'no'
   expect((await $.tool.check({ tool: 'Bash', input: { command: 'rm -rf build' }, tool_use_id: 'tu2' })).decision).toBe('deny')
   w.askAnswer = 'timeout'

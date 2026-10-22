@@ -65,10 +65,41 @@ describe('parseVoiceCommand', () => {
 })
 
 test('describeToolCall says what a permission is for', () => {
-  expect(describeToolCall('Bash', { command: 'npm   test' })).toBe('run the command: npm test')
+  expect(describeToolCall('Bash', { command: 'npm test', description: 'Run the unit tests.' })).toBe('run the unit tests')
   expect(describeToolCall('Edit', { file_path: '/repo/src/login.ts' })).toBe('edit login.ts')
   expect(describeToolCall('WebFetch', { url: 'https://docs.python.org/3/' })).toBe('fetch a page from docs.python.org')
   expect(describeToolCall('mcp__github__create_issue', {})).toBe('use create issue from github')
+})
+
+describe('describeToolCall never reads a shell command out', () => {
+  test('uses the description, lowercased and without its period', () => {
+    expect(describeToolCall('Bash', { command: 'grep -rn "Is that okay" hooks', description: 'Find how the voice permission question is worded' })).toBe(
+      'find how the voice permission question is worded',
+    )
+    expect(describeToolCall('PowerShell', { command: 'Get-ChildItem', description: 'List files.' })).toBe('list files')
+    expect(describeToolCall('Bash', { command: 'npm ci', description: 'NPM install' })).toBe('NPM install')
+  })
+
+  test('clips a long description', () => {
+    const said = describeToolCall('Bash', { command: 'ls', description: `List ${'very '.repeat(40)}many files` })
+    expect(said.length).toBeLessThanOrEqual(101)
+    expect(said.endsWith('…')).toBe(true)
+  })
+
+  test('without a description, names only the program', () => {
+    expect(describeToolCall('Bash', { command: 'git push --force origin main' })).toBe('run a git command')
+    expect(describeToolCall('Bash', { command: 'cd /repo && FOO=1 sudo npm test -- --watch' })).toBe('run a npm command')
+    expect(describeToolCall('Bash', { command: '/usr/bin/rm -rf build' })).toBe('run a rm command')
+    expect(describeToolCall('Bash', { command: 'uv run pytest' })).toBe('run a uv command')
+    expect(describeToolCall('Bash', { command: 'echo hi' })).toBe('run an echo command')
+    expect(describeToolCall('PowerShell', { command: 'Get-ChildItem C:\\' })).toBe('run a Get-ChildItem command')
+  })
+
+  test('falls back to a shell command when the program is unclear', () => {
+    expect(describeToolCall('Bash', {})).toBe('run a shell command')
+    expect(describeToolCall('Bash', { command: '$(curl -s https://example.com/x.sh)' })).toBe('run a shell command')
+    expect(describeToolCall('PowerShell', { command: '& $script' })).toBe('run a PowerShell command')
+  })
 })
 
 test('slugify makes agent names', () => {
