@@ -1,7 +1,7 @@
 {
   "name": "voice-agent",
-  "version": "0.3.3",
-  "description": "Talk with Claude out loud, fully local: Parakeet hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
+  "version": "0.4.0",
+  "description": "Talk with Claude out loud, fully local: Moonshine hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
   "author": {
     "name": "sabeel111"
   },
@@ -12,6 +12,7 @@
     "speech",
     "tts",
     "stt",
+    "moonshine",
     "parakeet",
     "phonon",
     "hyprland",
@@ -45,9 +46,12 @@
     "sttModel": {
       "type": "string",
       "title": "Speech recognition model",
-      "description": "NVIDIA Parakeet model. parakeet-v2 is English; parakeet-v3 covers 25 European languages.",
-      "default": "parakeet-v2",
+      "description": "moonshine-medium (245M) is small, fast on a CPU and about as accurate as Whisper Large v3; moonshine-small (123M) and moonshine-tiny (34M) are lighter and less accurate. Moonshine Medium is English only: for Spanish, German and Japanese Small is used, for other languages Tiny. parakeet-v2 (English) and parakeet-v3 (25 European languages) are NVIDIA's larger models, and can use an NVIDIA GPU.",
+      "default": "moonshine-medium",
       "options": [
+        "moonshine-medium",
+        "moonshine-small",
+        "moonshine-tiny",
         "parakeet-v2",
         "parakeet-v3"
       ]
@@ -55,12 +59,18 @@
     "sttDevice": {
       "type": "string",
       "title": "Speech recognition device",
-      "description": "auto uses an NVIDIA GPU when there is one (the first start downloads the CUDA runtime, about 2 GB, and the full model, about 2.4 GB), else the CPU.",
+      "description": "Parakeet only (Moonshine always runs on the CPU). auto uses an NVIDIA GPU when there is one (the first start downloads the CUDA runtime, about 2 GB, and the full model, about 2.4 GB), else the CPU.",
       "default": "auto",
       "options": [
         "auto",
         "cpu"
       ]
+    },
+    "sttKeyterms": {
+      "type": "string",
+      "title": "Key terms",
+      "description": "Names and jargon to recognize more reliably, comma-separated (e.g. Omarchy, Hyprland, Kubernetes). Moonshine only. The wake word's name is always included.",
+      "default": ""
     },
     "turnDetection": {
       "type": "boolean",

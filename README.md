@@ -4,7 +4,7 @@ Talk with Claude Code out loud, like talking to a colleague. You discuss a task,
 
 All the speech runs on your own machine:
 
-- **Hearing:** NVIDIA [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) through [onnx-asr](https://github.com/istupakov/onnx-asr), on an NVIDIA GPU when there is one, else int8 on the CPU, with WebRTC voice detection. It transcribes during the pause at the end of what you say, so the text is usually ready the moment the pause counts as the end.
+- **Hearing:** [Moonshine](https://github.com/moonshine-ai/moonshine) Streaming Medium by Moonshine AI (MIT, 245M parameters) on the CPU, with WebRTC voice detection. It is about as accurate as Whisper Large v3 at a sixth of the size, and favours the names you give it ("Claude", your project's words). NVIDIA [Parakeet TDT 0.6B](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) through [onnx-asr](https://github.com/istupakov/onnx-asr) is still there as a setting, and can use an NVIDIA GPU. Either one transcribes during the pause at the end of what you say, so the text is usually ready the moment the pause counts as the end.
 - **Knowing when you're done:** [Smart Turn v3](https://huggingface.co/pipecat-ai/smart-turn-v3) by Pipecat (BSD 2-Clause, 9 MB int8 ONNX) listens to how a sentence ends. If you sound finished, Claude answers about 0.15 s into the pause; if you trail off mid-thought ("can you check whether the…", "so I was thinking, um…"), it waits up to 1.2 s for you to go on. See [End-of-turn detection](#end-of-turn-detection).
 - **Speaking:** [Phonon](https://gradium.ai/phonon) 31m by Gradium: open weights (Apache 2.0), about 65 MB, streams audio while it generates.
 - **Audio:** PipeWire/PulseAudio (`parecord`/`paplay`), falling back to ALSA (`arecord`/`aplay`).
@@ -14,7 +14,7 @@ It is built and tested for Linux, Omarchy (Arch + Hyprland + PipeWire) in partic
 ## How it works
 
 ```
- you ─► mic ─► voice detection ─► Parakeet ─► "hey Claude, add dark mode"
+ you ─► mic ─► voice detection ─► Moonshine ─► "hey Claude, add dark mode"
                                                   │
                                                   ▼
                                    Claude, the partner (talks, plans, asks)
@@ -51,7 +51,7 @@ Push-to-talk works in every mode. Switch modes with `/talk mode natural`, the **
 sudo pacman -S --needed uv curl pipewire-pulse
 ```
 
-`uv` runs the voice helper and installs its Python dependencies (onnx-asr with onnxruntime, ptts, webrtcvad, numpy) into its own cache on first start. Nothing is installed system-wide.
+`uv` runs the voice helper and installs its Python dependencies (moonshine-voice, onnx-asr with onnxruntime, ptts, webrtcvad, numpy) into its own cache on first start. Nothing is installed system-wide.
 
 ### 2. The mod
 
@@ -75,7 +75,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 /talk on
 ```
 
-The first start downloads the Parakeet model (about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB), Phonon 31m (about 65 MB) and Smart Turn v3 (9 MB) from Hugging Face, which takes a minute. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
+The first start downloads Moonshine Streaming Medium from Moonshine AI's server (quantized; smaller than Parakeet's 650 MB), Phonon 31m (about 65 MB) and Smart Turn v3 (9 MB) from Hugging Face, which takes a minute. Parakeet, if you pick it, is about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
 
 ### 4. Push-to-talk key (Hyprland)
 
@@ -118,14 +118,15 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 | --- | --- | --- |
 | Listening mode | `wake` | `wake`, `natural` or `ptt` |
 | Wake word | `hey claude` | Matched loosely: "hey cloud" and "hey Clyde" also count |
-| Speech recognition model | `parakeet-v2` | English; `parakeet-v3` covers 25 European languages |
-| Speech recognition device | `auto` | An NVIDIA GPU when there is one, else the CPU. `cpu` skips the GPU download |
+| Speech recognition model | `moonshine-medium` | `moonshine-small` (123M) and `moonshine-tiny` (34M) are lighter and less accurate. `parakeet-v2` (English) and `parakeet-v3` (25 European languages) are NVIDIA's larger models |
+| Speech recognition device | `auto` | Parakeet only: an NVIDIA GPU when there is one, else the CPU. `cpu` skips the GPU download. Moonshine always runs on the CPU |
+| Key terms | (none) | Names and jargon to recognize more reliably, comma-separated, e.g. `Omarchy, Hyprland, Kubernetes`. Moonshine only; the wake word's name is always included |
 | Smart end-of-turn detection | on | Answer as soon as you sound finished; wait through pauses mid-sentence. Off: a fixed pause ends what you say (see below) |
 | Voice detection strictness | `3` | `0` to `3`. Higher ignores more background noise but may miss very quiet speech |
 | Minimum speech length (ms) | 500 | Shorter sounds are ignored |
 | Minimum loudness over background | 2 | How many times louder than the background noise speech must be. Higher ignores more background voices; `0` turns it off |
 | Pause that ends your turn (ms) | 800 | How long a silence means you've finished talking. Longer lets you pause mid-sentence; shorter replies sooner. Used when turn detection is off |
-| Language | `en` | Other languages need a multilingual Phonon 40m model and `parakeet-v3` |
+| Language | `en` | Other languages need a multilingual Phonon 40m model. Moonshine Medium is English only: Spanish, German and Japanese use Moonshine Small, Arabic, Vietnamese, Chinese and Tagalog Moonshine Tiny, the rest `parakeet-v3` |
 | Phonon voice model | Phonon 31m | e.g. `hf://gradium/phonon-40m-en` (non-commercial license, gated: accept its terms on Hugging Face, then `hf auth login`) |
 | Voice | model default | List voices with `uvx ptts --list-voices` |
 | Interrupt by talking | on | |
@@ -142,7 +143,7 @@ Change these in `/config` (or `/plugin` → voice-agent → configure):
 About 0.15 s into each pause, two things run side by side on the CPU:
 
 - **Smart Turn v3**, an audio model (a Whisper Tiny encoder with a classifier, 9 MB int8), gives the probability that you have finished, from the last 8 s of sound: intonation, rhythm and the words themselves.
-- **Parakeet** transcribes what you said so far.
+- **Moonshine** (or Parakeet) transcribes what you said so far.
 
 Then:
 
@@ -162,7 +163,7 @@ Measured on a Ryzen 5 5600H laptop (CPU only, int8 Parakeet, a busy machine), fr
 | Fixed 0.5 s pause (before) | 620 ms | cut in two, every time |
 | Smart Turn | 520 ms | kept whole, every time; sent about 0.6 s after the end |
 
-Most of what remains is Parakeet itself (0.2 to 0.3 s for a short request on this CPU) plus the voice detector's own hangover. Smart Turn takes 80 to 150 ms on this CPU (about 10 ms on recent ones with VNNI), but runs alongside the transcription, so it adds nothing. Turn it off with the **Smart end-of-turn detection** setting; the model is downloaded on first use to `~/.cache/voice-agent/models/smart-turn`.
+Most of what remains is the recognizer itself (0.2 to 0.3 s for a short request on this CPU) plus the voice detector's own hangover. Smart Turn takes 80 to 150 ms on this CPU (about 10 ms on recent ones with VNNI), but runs alongside the transcription, so it adds nothing. Turn it off with the **Smart end-of-turn detection** setting; the model is downloaded on first use to `~/.cache/voice-agent/models/smart-turn`.
 
 ## Natural mode without headphones: echo cancellation
 
@@ -184,10 +185,10 @@ Then `systemctl --user restart pipewire` and pick "Echo-cancelled mic" as the de
 
 ## Troubleshooting
 
-- **"could not start the voice helper"**: install `uv` (`sudo pacman -S uv`). Or point the **Voice helper command** setting at your own Python environment, e.g. `~/.venvs/voice/bin/python /path/to/helper/voice_helper.py`, after `pip install numpy 'onnx-asr[cpu,hub]' ptts webrtcvad-wheels` (for the GPU, `onnxruntime-gpu[cuda,cudnn]` in place of `onnxruntime`).
+- **"could not start the voice helper"**: install `uv` (`sudo pacman -S uv`). Or point the **Voice helper command** setting at your own Python environment, e.g. `~/.venvs/voice/bin/python /path/to/helper/voice_helper.py`, after `pip install numpy moonshine-voice 'onnx-asr[cpu,hub]' ptts webrtcvad-wheels` (for the GPU, `onnxruntime-gpu[cuda,cudnn]` in place of `onnxruntime`).
 - **"no recorder found"**: install `pipewire-pulse` (it provides `parecord`/`paplay`) or `alsa-utils`.
-- **It doesn't react to "hey Claude"**: try `small.en`, speak a little slower, or set your own wake word. `/talk status` shows the last notice.
-- **Model downloads fail**: they come from huggingface.co, so check that it's reachable. The 40m Phonon models also need `hf auth login`.
+- **It doesn't react to "hey Claude"**, or mishears names: add them under **Key terms**, use `moonshine-medium` if you picked a smaller model, speak a little slower, or set your own wake word. `/talk status` shows the last notice.
+- **Model downloads fail**: Moonshine comes from download.moonshine.ai, the rest from huggingface.co, so check that both are reachable. The 40m Phonon models also need `hf auth login`.
 - **Run the helper by hand** to see everything it logs:
   ```sh
   uv run --script helper/voice_helper.py --socket /tmp/v.sock --config '{"mode":"natural"}'
@@ -206,8 +207,8 @@ Layout:
 - `hooks/register.tsx`: the mod. Starts the helper, streams speech, runs the partner prompt, the `delegate_task` and `list_tasks` tools, voice permissions, `/talk` and the Voice pane.
 - `hooks/speech.ts`: sentence splitting, markdown-to-speech, spoken commands, permission wording.
 - `hooks/prompts.ts`: what the model reads.
-- `helper/voice_helper.py`: the local voice process: mic, voice detection, wake word, push-to-talk, Parakeet, Smart Turn end-of-turn detection, Phonon, barge-in and spoken yes/no questions, controlled over a Unix socket.
+- `helper/voice_helper.py`: the local voice process: mic, voice detection, wake word, push-to-talk, Moonshine and Parakeet, Smart Turn end-of-turn detection, Phonon, barge-in and spoken yes/no questions, controlled over a Unix socket.
 
 ## License
 
-Apache 2.0. Phonon 31m weights are Apache 2.0; the Phonon 40m models are CC BY-NC 4.0. Smart Turn v3 weights are BSD 2-Clause (Daily).
+Apache 2.0. Moonshine streaming models are MIT; Parakeet weights are CC BY 4.0. Phonon 31m weights are Apache 2.0; the Phonon 40m models are CC BY-NC 4.0. Smart Turn v3 weights are BSD 2-Clause (Daily).

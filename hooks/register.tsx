@@ -168,6 +168,7 @@ export const register: Register = (on, options) => {
         wake_word: opt.wakeWord,
         stt_model: opt.sttModel,
         stt_device: opt.sttDevice,
+        stt_keyterms: opt.sttKeyterms,
         turn_detection: opt.turnDetection,
         vad_aggressiveness: opt.vadStrictness,
         min_utterance_ms: opt.minSpeechMs,
@@ -515,6 +516,7 @@ type Options = {
   wakeWord: string
   sttModel: string
   sttDevice: string
+  sttKeyterms: string[]
   turnDetection: boolean
   vadStrictness: number
   minSpeechMs: number
@@ -546,8 +548,12 @@ function readOptions(o: PluginOptions): Options {
     autoStart: bool('autoStart', false),
     mode: mode === 'natural' || mode === 'ptt' ? mode : 'wake',
     wakeWord: str('wakeWord') || 'hey claude',
-    sttModel: str('sttModel') || 'parakeet-v2',
+    sttModel: str('sttModel') || 'moonshine-medium',
     sttDevice: str('sttDevice') || 'auto',
+    sttKeyterms: str('sttKeyterms')
+      .split(/[,;\n]/)
+      .map(t => t.trim().replace(/\s+/g, ' '))
+      .filter(Boolean),
     turnDetection: bool('turnDetection', true),
     vadStrictness: Number.isFinite(vadRaw) ? Math.min(3, Math.max(0, Math.trunc(vadRaw))) : 3,
     minSpeechMs: Math.max(0, Math.round(num('minSpeechMs', 500))),

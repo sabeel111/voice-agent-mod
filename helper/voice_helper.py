@@ -4,6 +4,7 @@
 # dependencies = [
 #   "numpy>=1.26",
 #   "onnx-asr[cpu,hub]>=0.12",
+#   "moonshine-voice>=0.1.5",
 #   "ptts>=0.4",
 #   "webrtcvad-wheels>=2.0.14",
 # ]
@@ -12,9 +13,9 @@
 
 Everything runs on this machine: the microphone is read through PipeWire /
 PulseAudio / ALSA command-line tools, speech is detected with WebRTC VAD,
-transcribed with NVIDIA Parakeet (onnx-asr; on the GPU when there is an
-NVIDIA one) and spoken with Phonon (ptts). Pipecat's Smart Turn model decides
-when the person has finished speaking.
+transcribed with Moonshine (moonshine-voice) or NVIDIA Parakeet (onnx-asr; on
+the GPU when there is an NVIDIA one) and spoken with Phonon (ptts). Pipecat's
+Smart Turn model decides when the person has finished speaking.
 
 The mod starts this process and reads newline-delimited JSON events from its
 stdout. It sends commands over HTTP on a Unix socket (``--socket``), which is
@@ -52,6 +53,7 @@ import threading
 import time
 from dataclasses import dataclass, field, fields
 from http.server import BaseHTTPRequestHandler
+from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 import numpy as np
@@ -63,14 +65,21 @@ FRAME_BYTES = FRAME_SAMPLES * 2
 
 MODES = ("natural", "wake", "ptt")
 
-DEFAULT_STT_MODEL = "nemo-parakeet-tdt-0.6b-v2"
+DEFAULT_STT_MODEL = "moonshine-medium"
+PARAKEET_DEFAULT = "nemo-parakeet-tdt-0.6b-v2"
 # onnx-asr model name -> Hugging Face repo with its ONNX export.
 STT_MODELS = {
     "nemo-parakeet-tdt-0.6b-v2": "istupakov/parakeet-tdt-0.6b-v2-onnx",  # English
     "nemo-parakeet-tdt-0.6b-v3": "istupakov/parakeet-tdt-0.6b-v3-onnx",  # 25 European languages
 }
-STT_ALIASES = {"parakeet": DEFAULT_STT_MODEL, "parakeet-v2": DEFAULT_STT_MODEL,
-               "parakeet-v3": "nemo-parakeet-tdt-0.6b-v3"}
+# Moonshine streaming models (MIT), largest first: setting name -> model arch.
+MOONSHINE_MODELS = {
+    "moonshine-medium": "medium-streaming",  # 245M, English
+    "moonshine-small": "small-streaming",  # 123M, also es, de, ja
+    "moonshine-tiny": "tiny-streaming",  # 34M, the most languages
+}
+STT_ALIASES = {"parakeet": PARAKEET_DEFAULT, "parakeet-v2": PARAKEET_DEFAULT,
+               "parakeet-v3": "nemo-parakeet-tdt-0.6b-v3", "moonshine": DEFAULT_STT_MODEL}
 GPU_RUNTIME = "onnxruntime-gpu[cuda,cudnn]>=1.20"
 
 YES_WORDS = {
@@ -105,7 +114,10 @@ class Config:
     follow_up_s: float = 8.0
     stt_model: str = DEFAULT_STT_MODEL
     stt_language: str = "en"
-    stt_device: str = "auto"  # auto | cuda | cpu
+    stt_device: str = "auto"  # auto | cuda | cpu (Parakeet only)
+    # Names and jargon the recognizer should favour (Moonshine only); the
+    # wake word's name ("Claude") is always among them.
+    stt_keyterms: list[str] = field(default_factory=list)
     stt_quant: str = ""  # "" picks int8 on the CPU, full precision on the GPU
     tts_model: str = ""
     tts_voice: str = ""
@@ -403,11 +415,31 @@ def play_once(argv: list[str], data: bytes) -> None:
 def resolve_stt_model(name: str) -> str:
     name = (name or "").strip()
     name = STT_ALIASES.get(name, name)
-    if name not in STT_MODELS:
+    if name not in STT_MODELS and name not in MOONSHINE_MODELS:
         if name:
             log(f"unknown speech recognition model {name!r}; using {DEFAULT_STT_MODEL}", "warn")
         return DEFAULT_STT_MODEL
     return name
+
+
+def is_parakeet(name: str) -> bool:
+    return name in STT_MODELS
+
+
+def stt_keyterms(cfg: Config) -> list[str]:
+    """The words to bias recognition towards: the wake word's name, then the person's own."""
+    terms = [w.capitalize() for w in normalize_words(cfg.wake_word) if w not in ("hey", "hi", "ok", "okay")]
+    terms += [" ".join(str(t).replace(",", " ").split()) for t in cfg.stt_keyterms]
+    out: list[str] = []
+    for t in terms:
+        if t and t.lower() not in (o.lower() for o in out):
+            out.append(t)
+    return out
+
+
+def make_stt(cfg: Config):
+    name = resolve_stt_model(cfg.stt_model)
+    return ParakeetSTT(cfg) if is_parakeet(name) else MoonshineSTT(cfg, name)
 
 
 def cuda_available() -> bool:
@@ -426,7 +458,8 @@ class ParakeetSTT:
         from huggingface_hub import snapshot_download
 
         self.cfg = cfg
-        self.name = name = resolve_stt_model(cfg.stt_model)
+        name = resolve_stt_model(cfg.stt_model)
+        self.name = name = name if is_parakeet(name) else PARAKEET_DEFAULT
         # A plain folder rather than the hub cache: newer onnxruntime refuses
         # external weight files that sit behind the cache's symlinks.
         folder = os.path.join(os.path.expanduser("~/.cache/voice-agent/models"), name)
@@ -455,6 +488,68 @@ class ParakeetSTT:
 
     def transcribe(self, audio: np.ndarray) -> str:
         return str(self.model.recognize(audio, sample_rate=MIC_RATE)).strip()
+
+
+class MoonshineSTT:
+    """Moonshine streaming models by Moonshine AI (MIT): small and fast on a CPU.
+
+    Medium (245M) is about as accurate as Whisper Large v3 at a sixth of the
+    size. Key terms bias the decoder towards names like "Claude".
+    """
+
+    def __init__(self, cfg: Config, name: str = DEFAULT_STT_MODEL):
+        from moonshine_voice import get_model_for_language, string_to_model_arch
+        from moonshine_voice.transcriber import Transcriber
+
+        self.cfg = cfg
+        self.device = "cpu"
+        language = (cfg.stt_language or "en").split("-")[0].lower()
+        arch = self._arch_for(language, MOONSHINE_MODELS.get(name, MOONSHINE_MODELS[DEFAULT_STT_MODEL]))
+        self.name = f"moonshine-{arch.split('-')[0]}"
+        folder = os.path.join(os.path.expanduser("~/.cache/voice-agent/models"), "moonshine")
+        shown = [0]
+
+        def progress(fraction: float, *_):
+            step = int(fraction * 4)  # a line at 25 %, 50 %, 75 % and done
+            if step > shown[0]:
+                shown[0] = step
+                log(f"downloading {self.name}: {step * 25}%")
+
+        path, model_arch = get_model_for_language(language, string_to_model_arch(arch),
+                                                  cache_root=Path(folder), on_progress=progress)
+        self.model = Transcriber(path, model_arch)
+        terms = stt_keyterms(cfg)
+        if terms:
+            try:
+                self.model.set_keyterms(terms)
+            except Exception as exc:
+                log(f"key terms unavailable ({exc})", "warn")
+        self.transcribe(np.zeros(MIC_RATE // 2, dtype=np.float32))  # warm up
+
+    @staticmethod
+    def _arch_for(language: str, wanted: str) -> str:
+        """The wanted streaming model, else the largest one this language has."""
+        from moonshine_voice import ModelArch, model_arch_to_string
+        from moonshine_voice.download import _stt_catalog
+
+        catalog = _stt_catalog()
+        if language not in catalog:
+            raise RuntimeError(f"Moonshine has no model for language {language!r}; "
+                               "choose parakeet-v3 (25 European languages)")
+        have = {model_arch_to_string(ModelArch(m["model_arch"])) for m in catalog[language]["models"]}
+        if wanted in have:
+            return wanted
+        for arch in MOONSHINE_MODELS.values():
+            if arch in have:
+                log(f"Moonshine {wanted.split('-')[0]} has no {language!r} model; using {arch.split('-')[0]}", "warn")
+                return arch
+        raise RuntimeError(f"Moonshine has no streaming model for language {language!r}; "
+                           "choose parakeet-v3 (25 European languages)")
+
+    def transcribe(self, audio: np.ndarray) -> str:
+        transcript = self.model.transcribe_without_streaming(
+            np.asarray(audio, dtype=np.float32).tolist(), sample_rate=MIC_RATE)
+        return " ".join(line.text.strip() for line in transcript.lines if line.text and line.text.strip())
 
 
 TURN_REPO = "pipecat-ai/smart-turn-v3"  # BSD 2-Clause
@@ -1255,7 +1350,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         emit("state", state="loading", mode=cfg.mode, muted=False, awake=False, asking=False, ptt=False)
         log(f"loading speech recognition ({resolve_stt_model(cfg.stt_model)}); the first run downloads it")
-        stt = ParakeetSTT(cfg)
+        stt = make_stt(cfg)
         log(f"speech recognition ready on the {stt.device.upper()}")
         turn = None
         if cfg.turn_detection:
@@ -1375,7 +1470,8 @@ if __name__ == "__main__":
     _ap = argparse.ArgumentParser(add_help=False)
     _ap.add_argument("--config", default="{}")
     _cfg = Config.from_json(_ap.parse_known_args()[0].config)
-    if _cfg.stt_device != "cpu":
+    # Only Parakeet runs on the GPU: Moonshine never needs the CUDA download.
+    if _cfg.stt_device != "cpu" and is_parakeet(resolve_stt_model(_cfg.stt_model)):
         emit("state", state="loading", mode=_cfg.mode, muted=False, awake=False, asking=False, ptt=False)
         relaunch_on_gpu()
     sys.exit(main())

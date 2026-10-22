@@ -112,9 +112,21 @@ test('/talk on starts the helper with uv and the socket', async ($, on) => {
   const config = JSON.parse(argv.at(-1) ?? '{}') as Record<string, unknown>
   expect(config.wake_word).toBe('hey claude')
   expect(config.mode).toBe('wake')
+  expect(config.stt_model).toBe('moonshine-medium')
+  expect(config.stt_keyterms).toEqual([])
   const off = await talk($, 'off')
   expect(off.text).toBe('Voice is off.')
   expect(w.fetches.at(-1)?.path).toBe('/shutdown')
+})
+
+test('the speech settings reach the helper', { options: { sttModel: 'moonshine-small', sttKeyterms: ' Omarchy, Hyprland  config;; Kubernetes ' } }, async ($, on) => {
+  const w = world(on)
+  await voiceOn($, w)
+  await until(() => w.argv.length === 1, 'the helper to start')
+  const config = JSON.parse(w.argv[0]?.at(-1) ?? '{}') as Record<string, unknown>
+  expect(config.stt_model).toBe('moonshine-small')
+  expect(config.stt_keyterms).toEqual(['Omarchy', 'Hyprland config', 'Kubernetes'])
+  await talk($, 'off')
 })
 
 test('what the person says becomes a prompt; spoken commands stay local', async ($, on) => {

@@ -172,9 +172,119 @@ def test_hallucinations_are_dropped():
 
 
 def test_stt_model_names():
-    assert vh.resolve_stt_model("") == vh.DEFAULT_STT_MODEL
+    assert vh.resolve_stt_model("") == vh.DEFAULT_STT_MODEL == "moonshine-medium"
+    assert vh.resolve_stt_model("moonshine-small") == "moonshine-small"
+    assert vh.resolve_stt_model("parakeet-v2") == vh.PARAKEET_DEFAULT
     assert vh.resolve_stt_model("parakeet-v3") == "nemo-parakeet-tdt-0.6b-v3"
     assert vh.resolve_stt_model("base.en") == vh.DEFAULT_STT_MODEL  # an old Whisper setting
+    assert vh.is_parakeet(vh.resolve_stt_model("parakeet-v3"))
+    assert not vh.is_parakeet(vh.resolve_stt_model("moonshine-tiny"))
+
+
+def test_make_stt_picks_the_engine(monkeypatch):
+    monkeypatch.setattr(vh, "ParakeetSTT", lambda cfg: ("parakeet", cfg.stt_model))
+    monkeypatch.setattr(vh, "MoonshineSTT", lambda cfg, name: ("moonshine", name))
+    assert vh.make_stt(vh.Config()) == ("moonshine", "moonshine-medium")
+    assert vh.make_stt(vh.Config(stt_model="moonshine-small")) == ("moonshine", "moonshine-small")
+    assert vh.make_stt(vh.Config(stt_model="parakeet-v3")) == ("parakeet", "parakeet-v3")
+
+
+def test_keyterms_lead_with_the_wake_word():
+    cfg = vh.Config(wake_word="hey claude", stt_keyterms=["Omarchy", "  Hyprland   config ", "claude", ""])
+    assert vh.stt_keyterms(cfg) == ["Claude", "Omarchy", "Hyprland config"]
+    assert vh.stt_keyterms(vh.Config(wake_word="okay jarvis")) == ["Jarvis"]
+
+
+class FakeMoonshine:
+    """Stands in for the moonshine_voice package: a catalog, a download and a transcriber."""
+
+    CATALOG = {
+        "en": {"english_name": "English", "models": [{"model_arch": 5}, {"model_arch": 4}, {"model_arch": 2}]},
+        "de": {"english_name": "German", "models": [{"model_arch": 4}, {"model_arch": 2}]},
+        "ko": {"english_name": "Korean", "models": [{"model_arch": 0}]},
+    }
+
+    def __init__(self, monkeypatch, lines=("Hey Claude,", " check the build. ")):
+        import enum
+        import types
+
+        class ModelArch(enum.IntEnum):
+            TINY = 0
+            BASE = 1
+            TINY_STREAMING = 2
+            BASE_STREAMING = 3
+            SMALL_STREAMING = 4
+            MEDIUM_STREAMING = 5
+
+        names = {0: "tiny", 1: "base", 2: "tiny-streaming", 3: "base-streaming", 4: "small-streaming", 5: "medium-streaming"}
+        fake = self
+        self.downloads: list[tuple] = []
+        self.keyterms: list[list[str]] = []
+        self.audio: list[int] = []
+
+        class Line:
+            def __init__(self, text):
+                self.text = text
+
+        class Transcript:
+            def __init__(self, texts):
+                self.lines = [Line(t) for t in texts]
+
+        class Transcriber:
+            def __init__(self, path, arch):
+                fake.loaded = (path, arch)
+
+            def set_keyterms(self, terms):
+                fake.keyterms.append(list(terms))
+
+            def transcribe_without_streaming(self, audio, sample_rate=16000):
+                assert sample_rate == vh.MIC_RATE and isinstance(audio, list)
+                fake.audio.append(len(audio))
+                return Transcript(lines if len(fake.audio) > 1 else [])
+
+        def get_model_for_language(language, arch, *, cache_root=None, on_progress=None):
+            fake.downloads.append((language, names[int(arch)], str(cache_root)))
+            if on_progress:
+                for f in (0.1, 0.3, 0.6, 1.0):
+                    on_progress(f, "model")
+            return f"/models/{language}/{names[int(arch)]}", arch
+
+        root = types.ModuleType("moonshine_voice")
+        root.ModelArch = ModelArch
+        root.model_arch_to_string = lambda a: names[int(a)]
+        root.string_to_model_arch = lambda s: ModelArch({v: k for k, v in names.items()}[s])
+        root.get_model_for_language = get_model_for_language
+        download = types.ModuleType("moonshine_voice.download")
+        download._stt_catalog = lambda: FakeMoonshine.CATALOG
+        transcriber = types.ModuleType("moonshine_voice.transcriber")
+        transcriber.Transcriber = Transcriber
+        for name, mod in (("moonshine_voice", root), ("moonshine_voice.download", download),
+                          ("moonshine_voice.transcriber", transcriber)):
+            monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_moonshine_loads_transcribes_and_biases(events, monkeypatch):
+    fake = FakeMoonshine(monkeypatch)
+    stt = vh.MoonshineSTT(vh.Config(stt_keyterms=["Omarchy"]), "moonshine-medium")
+    assert stt.name == "moonshine-medium" and stt.device == "cpu"
+    language, arch, cache = fake.downloads[0]
+    assert (language, arch) == ("en", "medium-streaming")
+    assert cache.endswith(".cache/voice-agent/models/moonshine")
+    assert fake.keyterms == [["Claude", "Omarchy"]]
+    assert fake.audio == [vh.MIC_RATE // 2]  # warmed up
+    assert [e["msg"] for e in events.of("log")] == [f"downloading moonshine-medium: {p}%" for p in (25, 50, 100)]
+    assert stt.transcribe(np.zeros(8000, dtype=np.float32)) == "Hey Claude, check the build."
+
+
+def test_moonshine_falls_back_to_a_model_the_language_has(events, monkeypatch):
+    fake = FakeMoonshine(monkeypatch)
+    stt = vh.MoonshineSTT(vh.Config(stt_language="de"), "moonshine-medium")
+    assert fake.downloads[0][:2] == ("de", "small-streaming") and stt.name == "moonshine-small"
+    assert any("no 'de' model; using small" in e["msg"] for e in events.of("log"))
+    with pytest.raises(RuntimeError, match="parakeet-v3"):
+        vh.MoonshineSTT(vh.Config(stt_language="ko"), "moonshine-small")
+    with pytest.raises(RuntimeError, match="parakeet-v3"):
+        vh.MoonshineSTT(vh.Config(stt_language="xx"), "moonshine-small")
 
 
 def test_early_transcript_is_reused_when_the_pause_ends_the_utterance(events):
@@ -595,7 +705,7 @@ def test_take_over_socket_stops_the_other_helper(server):
 def test_main_end_to_end(events, monkeypatch):
     stt = ScriptedSTT()
     stt.texts = ["Hey Claude, what's the plan?"]
-    monkeypatch.setattr(vh, "ParakeetSTT", lambda cfg: setattr(stt, "device", "cpu") or stt)
+    monkeypatch.setattr(vh, "make_stt", lambda cfg: setattr(stt, "device", "cpu") or stt)
     monkeypatch.setattr(vh, "PhononTTS", lambda cfg: FakeTTS())
     tmp = tempfile.mkdtemp()
     sock = os.path.join(tmp, "v.sock")
