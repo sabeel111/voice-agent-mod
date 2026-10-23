@@ -826,12 +826,13 @@ class Speaker:
             if done:
                 done.set()
             # Replies arrive sentence by sentence: give the next one a moment
-            # to show up before closing the player.
-            for _ in range(6):
+            # to show up before closing the player. Stopped: no need to wait.
+            stopped = not self._current(gen)
+            for _ in range(0 if stopped else 6):
                 if not self._q.empty():
                     break
                 time.sleep(0.05)
-            if self._q.empty():
+            if stopped or self._q.empty():
                 if self._current(gen):
                     self.player.drain()
                 self._set_speaking(False)
@@ -853,6 +854,14 @@ NOISE_FLOOR_MIN = 0.002
 # BARGE_IN_CHECKS times in all.
 BARGE_IN_VERIFY_MS = 800
 BARGE_IN_CHECKS = 3
+
+# Speech over our own voice comes out of the echo canceller damaged, so a
+# confirmed barge-in only stops Claude: the audio heard so far is dropped, and
+# the person's turn is what they say next. The first BARGE_IN_TAIL_MS after
+# the stop are dropped too (a Bluetooth speaker plays on for 200 to 300 ms),
+# and if they don't speak within BARGE_IN_FOLLOW_UP_MS, nothing is sent.
+BARGE_IN_TAIL_MS = 300
+BARGE_IN_FOLLOW_UP_MS = 3000
 
 
 class Listener:
@@ -900,6 +909,14 @@ class Listener:
         self.verify_sent = False
         self.verify_at = BARGE_IN_VERIFY_MS
         self.verdict: Optional[tuple[int, Optional[bool]]] = None
+        # After a barge-in: frames of echo tail left to drop, frames left to
+        # wait for the person to go on, and the utterance that followed it.
+        # Set restart_pending from another thread to start this on the next
+        # frame (see restart_after_barge).
+        self.restart_pending = False
+        self.tail_skip = 0
+        self.follow_up = 0
+        self.after_barge = 0
         self.hands_free = True
         self.preroll: collections.deque[bytes] = collections.deque(maxlen=max(1, 450 // FRAME_MS))
         self.window: collections.deque[bool] = collections.deque(maxlen=10)
@@ -923,6 +940,8 @@ class Listener:
             self.ptt = True
             self.ptt_buf = list(self.preroll)
             self._reset_vad()
+            self.restart_pending = False
+            self.tail_skip = self.follow_up = 0
 
     def ptt_up(self) -> None:
         with self.lock:
@@ -956,7 +975,18 @@ class Listener:
             self.preroll.append(frame)
             return
 
-        speaking = self.is_speaking()
+        if self.restart_pending:
+            self.restart_pending = False
+            self._restart_after_barge()
+        if self.tail_skip > 0:
+            self.tail_skip -= 1  # the speaker's echo tail: not the person
+            return
+        # Just stopped by a barge-in: what comes next is the person's turn,
+        # even while the speaker thread is still winding down.
+        after_barge = self.follow_up > 0 or (self.in_speech and self.after_barge == self.utterances)
+        if self.follow_up > 0 and not self.in_speech:
+            self.follow_up -= 1
+        speaking = self.is_speaking() and not after_barge
         voiced = raw_voiced = self.vad(frame)
         if speaking and self.cfg.barge_in and self.cfg.mode == "natural" and not self.barging:
             # Our own voice leaks into the mic: only a loud, sustained voice
@@ -1010,15 +1040,18 @@ class Listener:
         if self.silence * FRAME_MS >= self._silence_limit(key) or too_long:
             audio = b"".join(self.buf)
             voiced_ms = self.voiced * FRAME_MS
+            # Ended before its barge-in check came back: heard over our voice.
+            source = "barge" if self.unverified else "voice"
             self._reset_vad()
             if voiced_ms >= self.cfg.min_utterance_ms:
-                self.on_utterance(audio, "voice", None if too_long else key)
+                self.on_utterance(audio, source, None if too_long else key)
 
     # ---- barge-in check
     def _verify(self, speaking: bool) -> bool:
         """Send the would-be barge-in for checking, or act on the answer.
 
-        True when the utterance was dropped as our own voice.
+        True when the utterance was dropped: as our own voice, or because it
+        stopped Claude and the person's turn starts afresh.
         """
         verdict = self.verdict
         if verdict is not None and verdict[0] == self.utterances and verdict[1] is None:
@@ -1034,6 +1067,9 @@ class Listener:
             self.unverified = False
             if verdict[1]:
                 self.on_barge_in()
+                if speaking:
+                    self._restart_after_barge()
+                    return True
             elif speaking:
                 self._reset_vad()
                 return True
@@ -1042,6 +1078,17 @@ class Listener:
             self.verify_sent = True
             self.on_verify(b"".join(self.buf), self.utterances)
         return False
+
+    def _restart_after_barge(self) -> None:
+        """Drop what was heard over our voice, and the echo tail after it."""
+        self._reset_vad()
+        self.preroll.clear()
+        self.tail_skip = BARGE_IN_TAIL_MS // FRAME_MS
+        self.follow_up = BARGE_IN_FOLLOW_UP_MS // FRAME_MS
+
+    def restart_after_barge(self) -> None:
+        """From another thread: Claude was just stopped, listen afresh."""
+        self.restart_pending = True
 
     def verifying(self, n: int) -> bool:
         """Is utterance n a barge-in still waiting for its check?"""
@@ -1118,6 +1165,9 @@ class Listener:
         self.utterances += 1
         self.silence = 0
         self.voiced = max(1, sum(self.window))
+        if self.follow_up > 0:
+            self.after_barge = self.utterances
+            self.follow_up = 0
         self.buf = list(self.preroll)
         if frame is not None:
             self.buf.append(frame)
@@ -1367,6 +1417,10 @@ class Controller:
     def handle_text(self, text: str, source: str, during_speech: bool = False) -> None:
         """Decide what one transcribed utterance is for."""
         text = text.strip()
+        # "barge": heard over our voice, and it ended before its check did.
+        barge = source == "barge"
+        if barge:
+            source = "voice"
         if is_hallucination(text):
             return
         if source != "ptt" and during_speech and self._is_own_voice(text):
@@ -1395,6 +1449,11 @@ class Controller:
             if source != "ptt" and self.speaker.speaking and self.cfg.barge_in:
                 # A barge-in that ended before its check came back.
                 self._on_barge_in()
+                if barge:
+                    # Only the trigger: its words are garbled by the overlap.
+                    # The person's turn is what they say next.
+                    self.listener.restart_after_barge()
+                    return
             self._deliver(text, source)
             return
 

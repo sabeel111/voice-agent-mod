@@ -679,18 +679,109 @@ def test_empty_transcript_while_speaking_is_ignored(events):
     assert not ctl.listener.in_speech
 
 
-def test_real_words_while_speaking_stop_the_speaker_and_are_delivered(events):
+def talk_after_the_stop(ctl, frames=20):
+    """Drop through the echo tail, then say something and pause."""
+    lis = ctl.listener
+    for _ in range(vh.BARGE_IN_TAIL_MS // vh.FRAME_MS):
+        lis.feed(LOUD)  # the speaker's echo tail: dropped
+    for _ in range(frames):
+        lis.feed(LOUD)
+    for _ in range(20):
+        lis.feed(silent_frame())
+
+
+def test_real_words_while_speaking_stop_the_speaker_but_only_what_follows_is_delivered(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0, silence_ms=300,
+                                             min_utterance_ms=200)
+    heard: list[int] = []
+    transcribe = stt.transcribe
+    stt.transcribe = lambda audio: heard.append(len(audio)) or transcribe(audio)
+    ctl.speaker.last_spoken = "The build passed and I pushed the branch."
+    stt.texts = ["Because of five interviews."] + ["Use the other database."] * 3
+    barge_while_speaking(ctl)
+    assert events.of("barge_in") and player.stopped >= 1
+    assert not ctl.listener.in_speech  # the overlapped audio is gone
+    ctl.speaker.speaking = False
+    talk_after_the_stop(ctl)
+    events.wait_for("transcript")
+    assert [e["text"] for e in events.of("transcript")] == ["Use the other database."]
+    assert len(events.of("barge_in")) == 1
+    # only post-stop audio (and silence) reached the recognizer for the turn
+    assert max(heard[1:]) <= (20 + 20) * vh.FRAME_SAMPLES
+
+
+def test_nothing_said_after_a_barge_in_sends_nothing(events):
     ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0, silence_ms=300,
                                              min_utterance_ms=200)
     ctl.speaker.last_spoken = "The build passed and I pushed the branch."
-    stt.texts = ["Wait, use the other database."] * 3
+    stt.texts = ["Stop."] + ["Because of five interviews."] * 3
     barge_while_speaking(ctl)
     assert events.of("barge_in") and player.stopped >= 1
     ctl.speaker.speaking = False
-    for _ in range(20):
+    for _ in range((vh.BARGE_IN_TAIL_MS + vh.BARGE_IN_FOLLOW_UP_MS) // vh.FRAME_MS + 20):
         ctl.listener.feed(silent_frame())
-    events.wait_for("transcript")
-    assert events.of("transcript")[-1]["text"] == "Wait, use the other database."
+    time.sleep(0.1)
+    assert events.of("transcript") == [] and stt.calls == 1
+    assert ctl.listener.follow_up == 0
+
+
+def test_listener_drops_the_overlap_and_the_echo_tail_after_a_barge_in():
+    checks: list = []
+    lis, got, barge = make_listener(speaking=lambda: True, checks=checks)
+    for _ in range(30):
+        lis.feed(LOUD)
+    lis.verify_result(checks[0][1], True)
+    lis.feed(LOUD)
+    assert barge == [1] and not lis.in_speech
+    for _ in range(vh.BARGE_IN_TAIL_MS // vh.FRAME_MS):
+        lis.feed(LOUD)
+    assert not lis.in_speech  # the echo tail is not heard at all
+    for _ in range(20):
+        lis.feed(LOUD)
+    for _ in range(20):
+        lis.feed(silent_frame())
+    # one fresh utterance of post-stop audio only, though still "speaking"
+    assert len(got) == 1 and got[0][1] == "voice"
+    assert got[0][0] <= (20 + 20) * vh.FRAME_BYTES
+    assert len(checks) == 1 and barge == [1]
+
+
+def test_a_barge_in_that_ends_before_its_check_is_only_a_trigger(events):
+    ctl, *_ = make_controller("natural")
+    ctl.speaker.last_spoken = "The build passed and I pushed the branch."
+    ctl.speaker.speaking = True
+    ctl.handle_text("Because of five interviews.", "barge", during_speech=True)
+    assert events.of("barge_in") and events.of("transcript") == []
+    assert ctl.listener.restart_pending
+    # Claude already finished: nothing to stop, so it is the person's turn
+    ctl.speaker.speaking = False
+    ctl.handle_text("Use the other database.", "barge", during_speech=True)
+    assert events.of("transcript")[-1] == {"type": "transcript", "text": "Use the other database.",
+                                           "source": "voice"}
+
+
+def test_listener_marks_an_unchecked_barge_in(events):
+    lis, got, barge = make_listener(speaking=lambda: True, checks=[])
+    for _ in range(20):
+        lis.feed(LOUD)
+    for _ in range(20):
+        lis.feed(silent_frame())
+    assert got and got[-1][1] == "barge" and barge == []
+
+
+def test_push_to_talk_right_after_a_barge_in_hears_everything():
+    checks: list = []
+    lis, got, barge = make_listener(speaking=lambda: True, checks=checks)
+    for _ in range(30):
+        lis.feed(LOUD)
+    lis.verify_result(checks[0][1], True)
+    lis.feed(LOUD)
+    lis.ptt_down()
+    for _ in range(20):
+        lis.feed(LOUD)
+    lis.ptt_up()
+    assert got == [(20 * vh.FRAME_BYTES, "ptt", None)]
+    assert lis.tail_skip == 0 and lis.follow_up == 0
 
 
 def test_a_single_word_over_our_voice_waits_for_more_before_barging_in(events):
@@ -731,14 +822,12 @@ def test_a_real_interruption_passes_the_speech_check(events):
                                              min_utterance_ms=200)
     ctl.speech = lambda audio: len(audio) * 1000 // vh.MIC_RATE * 3 // 4
     ctl.speaker.last_spoken = "The build passed and I pushed the branch."
-    stt.texts = ["Wait, use the other database."] * 3
+    stt.texts = ["Wait, use the other database."] + ["Use the other database."] * 3
     barge_while_speaking(ctl)
     assert events.of("barge_in") and player.stopped >= 1
-    ctl.speaker.speaking = False
-    for _ in range(20):
-        ctl.listener.feed(silent_frame())
+    talk_after_the_stop(ctl)
     events.wait_for("transcript")
-    assert events.of("transcript")[-1]["text"] == "Wait, use the other database."
+    assert events.of("transcript")[-1]["text"] == "Use the other database."
 
 
 def test_wake_word_while_speaking_interrupts(events):
