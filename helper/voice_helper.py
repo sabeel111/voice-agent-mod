@@ -126,6 +126,12 @@ class Config:
     barge_in: bool = True
     barge_in_rms: float = 0.03
     barge_in_ms: int = 300
+    # Hands-free utterances must hold this much human speech by the Silero
+    # VAD (WebRTC VAD, which cuts the utterances, takes fan noise and the echo
+    # canceller's leftovers of our own voice for speech), and over or just
+    # after our own voice, speech_min_overlap_ms. 0 turns the check off.
+    speech_min_ms: int = 250
+    speech_min_overlap_ms: int = 600
     # An utterance that ends within this long after Claude stops talking may
     # still be its own voice: the room's echo, and Bluetooth speakers lag by
     # 200 to 300 ms. Such utterances are checked against what was just said.
@@ -271,8 +277,30 @@ def is_echo(heard: str, spoken: str, threshold: float = 0.6) -> bool:
         return False
     if len(a) <= 2:
         return " ".join(a) in " ".join(b)
-    common = sum(1 for w in a if w in set(b))
+    vocab = set(b)
+
+    def said(word: str) -> bool:
+        # A garbled echo turns "longer" into "longest": close enough counts.
+        return word in vocab or (len(word) >= 4 and bool(difflib.get_close_matches(word, vocab, 1, 0.75)))
+
+    common = sum(1 for w in a if said(w))
     return common / len(a) >= threshold
+
+
+# While Claude speaks, a recognizer turns the leftovers of its voice into a
+# word or two ("important", "I love that"). Over our own voice, the person
+# must say at least this many words, or one of these, to count.
+OVERLAP_MIN_WORDS = 3
+INTERRUPT_PHRASES = {
+    "stop", "wait", "pause", "cancel", "enough", "quiet", "be quiet", "shut up",
+    "hold on", "hang on", "stop it", "stop talking", "stop stop", "wait wait",
+    "never mind", "no stop", "no wait", "okay stop", "ok stop", "claude", "hey claude",
+}
+
+
+def too_short_to_interrupt(text: str) -> bool:
+    words = normalize_words(text)
+    return len(words) < OVERLAP_MIN_WORDS and " ".join(words) not in INTERRUPT_PHRASES
 
 
 # Words a finished request almost never ends on: a pause after one of them is
@@ -657,6 +685,53 @@ class SmartTurn:
         return float(np.asarray(out).reshape(-1)[0])
 
 
+SILERO_REPO = "istupakov/silero-vad-onnx"  # Silero VAD v5, MIT
+SILERO_FILE = "silero_vad.onnx"  # about 2 MB
+
+
+class SileroVAD:
+    """Silero VAD: how much of a clip is a human voice.
+
+    WebRTC VAD is cheap enough to cut the mic stream into utterances, but it
+    passes fan noise and what the echo canceller leaves of our own voice, and
+    the recognizer makes phantom phrases of both. Silero tells them apart.
+    """
+
+    WINDOW = 512  # 32 ms at 16 kHz
+    CONTEXT = 64
+    THRESHOLD = 0.5
+
+    def __init__(self):
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+
+        folder = os.path.join(os.path.expanduser("~/.cache/voice-agent/models"), "silero-vad")
+        path = os.path.join(folder, SILERO_FILE)
+        if not os.path.exists(path):
+            path = hf_hub_download(SILERO_REPO, SILERO_FILE, local_dir=folder)
+        so = ort.SessionOptions()
+        so.inter_op_num_threads = 1
+        so.intra_op_num_threads = 1
+        self.session = ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
+        self.lock = threading.Lock()
+
+    def speech_ms(self, audio: np.ndarray) -> int:
+        """Milliseconds of speech in audio (float32 at 16 kHz)."""
+        audio = np.asarray(audio, dtype=np.float32)
+        state = np.zeros((2, 1, 128), dtype=np.float32)
+        context = np.zeros(self.CONTEXT, dtype=np.float32)
+        sr = np.array(MIC_RATE, dtype=np.int64)
+        voiced = 0
+        with self.lock:
+            for i in range(0, len(audio) - self.WINDOW + 1, self.WINDOW):
+                window = audio[i:i + self.WINDOW]
+                out, state = self.session.run(
+                    ["output", "stateN"], {"input": np.concatenate([context, window])[None], "state": state, "sr": sr})
+                context = window[-self.CONTEXT:]
+                voiced += float(np.asarray(out).reshape(-1)[0]) >= self.THRESHOLD
+        return voiced * self.WINDOW * 1000 // MIC_RATE
+
+
 class PhononTTS:
     def __init__(self, cfg: Config):
         import ptts
@@ -774,7 +849,10 @@ NOISE_FLOOR_MIN = 0.002
 # A barge-in is only taken once this much audio (pre-roll included)
 # transcribes to words Claude did not just say: an echo canceller leaves our
 # own voice loud enough to trip the level check, but without words in it.
+# Too few words to tell yet: check again with this much more audio, up to
+# BARGE_IN_CHECKS times in all.
 BARGE_IN_VERIFY_MS = 800
+BARGE_IN_CHECKS = 3
 
 
 class Listener:
@@ -820,7 +898,8 @@ class Listener:
         self.barging = False
         self.unverified = False
         self.verify_sent = False
-        self.verdict: Optional[tuple[int, bool]] = None
+        self.verify_at = BARGE_IN_VERIFY_MS
+        self.verdict: Optional[tuple[int, Optional[bool]]] = None
         self.hands_free = True
         self.preroll: collections.deque[bytes] = collections.deque(maxlen=max(1, 450 // FRAME_MS))
         self.window: collections.deque[bool] = collections.deque(maxlen=10)
@@ -891,6 +970,7 @@ class Listener:
                 self.voiced = voiced_frames
                 self.barging = self.unverified = True
                 self.verify_sent = False
+                self.verify_at = BARGE_IN_VERIFY_MS
             else:
                 self.preroll.append(frame)
             return
@@ -941,7 +1021,15 @@ class Listener:
         True when the utterance was dropped as our own voice.
         """
         verdict = self.verdict
-        if verdict is not None and verdict[0] == self.utterances:
+        if verdict is not None and verdict[0] == self.utterances and verdict[1] is None:
+            # Not enough to tell yet: listen on, and ask again.
+            self.verdict = None
+            if self.verify_at < BARGE_IN_VERIFY_MS * BARGE_IN_CHECKS:
+                self.verify_at += BARGE_IN_VERIFY_MS
+                self.verify_sent = False
+            else:
+                verdict = (self.utterances, False)
+        if verdict is not None and verdict[0] == self.utterances and verdict[1] is not None:
             self.verdict = None
             self.unverified = False
             if verdict[1]:
@@ -950,7 +1038,7 @@ class Listener:
                 self._reset_vad()
                 return True
             # Claude finished meanwhile: carry on as an ordinary utterance.
-        elif not self.verify_sent and len(self.buf) * FRAME_MS >= BARGE_IN_VERIFY_MS:
+        elif not self.verify_sent and len(self.buf) * FRAME_MS >= self.verify_at:
             self.verify_sent = True
             self.on_verify(b"".join(self.buf), self.utterances)
         return False
@@ -959,8 +1047,11 @@ class Listener:
         """Is utterance n a barge-in still waiting for its check?"""
         return self.unverified and self.utterances == n
 
-    def verify_result(self, n: int, ok: bool) -> None:
-        """The check of utterance n: does it hold words of the person's own?"""
+    def verify_result(self, n: int, ok: Optional[bool]) -> None:
+        """The check of utterance n: does it hold words of the person's own?
+
+        None: too little to tell yet.
+        """
         self.verdict = (n, ok)
 
     def _track_noise(self, level: float) -> None:
@@ -1051,9 +1142,12 @@ class Ask:
 class Controller:
     def __init__(self, cfg: Config, stt, speaker_factory: Callable[["Controller"], Speaker],
                  chime: Callable[[str], None] = lambda name: None,
-                 turn: Optional[Callable[[np.ndarray], float]] = None):
+                 turn: Optional[Callable[[np.ndarray], float]] = None,
+                 speech: Optional[Callable[[np.ndarray], int]] = None):
         self.cfg = cfg
         self.stt = stt
+        # Milliseconds of human voice in a clip (SileroVAD.speech_ms), if loaded.
+        self.speech = speech
         self.chime = chime
         self.lock = threading.RLock()
         self.muted = False
@@ -1150,8 +1244,11 @@ class Controller:
         emit("barge_in")
 
     def _on_utterance(self, audio: bytes, source: str, key: Optional[tuple[int, int]] = None) -> None:
+        # Did any of it overlap our own voice or its echo? An utterance that
+        # began over Claude's last words may end well after them.
         tail = self.cfg.echo_tail_ms / 1000
-        during_speech = self.speaker.speaking or time.monotonic() - self.speaker.last_end < tail
+        began = time.monotonic() - len(audio) / (2 * MIC_RATE)
+        during_speech = self.speaker.speaking or began - self.speaker.last_end < tail
         self.jobs.put(("final", audio, source, during_speech, key))
 
     def _on_verify(self, audio: bytes, n: int) -> None:
@@ -1164,6 +1261,23 @@ class Controller:
         """
         return (is_hallucination(text) or is_echo_phantom(text)
                 or is_echo(text, self.speaker.last_spoken))
+
+    def _not_a_voice(self, audio: bytes, during_speech: bool) -> bool:
+        """Too little human speech in a hands-free clip to be the person."""
+        need = self.cfg.speech_min_ms
+        if during_speech and self.ask is None:  # a spoken "yes" is short
+            need = max(need, self.cfg.speech_min_overlap_ms)
+        if self.speech is None or need <= 0:
+            return False
+        try:
+            heard = self.speech(np.frombuffer(audio, dtype=np.int16).astype(np.float32) / 32768.0)
+        except Exception as exc:
+            log(f"speech check failed ({exc})", "warn")
+            return False
+        if heard < need:
+            log(f"not a voice: {heard} ms of speech in {len(audio) * 1000 // (2 * MIC_RATE)} ms", "debug")
+            return True
+        return False
 
     def _on_pause(self, audio: bytes, key: tuple[int, int]) -> None:
         self.jobs.put(("early", audio, key))
@@ -1207,16 +1321,29 @@ class Controller:
                 _, audio, n = job
                 if not self.listener.verifying(n):
                     continue  # the utterance is over: its final job decides
-                try:
-                    text = self._transcribe(audio).strip()
-                except Exception as exc:
-                    log(f"barge-in check failed ({exc})", "warn")
-                    text = ""
-                ok = not self._is_own_voice(text)
-                log(f"barge-in {'taken' if ok else 'ignored'}: {text!r}", "debug")
+                text = ""
+                voice = not self._not_a_voice(audio, True)
+                if voice:
+                    try:
+                        text = self._transcribe(audio).strip()
+                    except Exception as exc:
+                        log(f"barge-in check failed ({exc})", "warn")
+                ok: Optional[bool]
+                if not voice:
+                    ok = None  # maybe the pre-roll was most of it: hear more
+                elif self._is_own_voice(text):
+                    ok = False
+                elif too_short_to_interrupt(text):
+                    ok = None  # a word or two so far: hear more before deciding
+                else:
+                    ok = True
+                log(f"barge-in {({True: 'taken', False: 'ignored', None: 'undecided'})[ok]}: {text!r}", "debug")
                 self.listener.verify_result(n, ok)
                 continue
             _, audio, source, during_speech, key = job
+            if source != "ptt" and self._not_a_voice(audio, during_speech):
+                self.early = (None, "")
+                continue
             self.transcribing += 1
             self._publish()
             try:
@@ -1246,6 +1373,10 @@ class Controller:
             return
 
         ask = self.ask
+        if (source != "ptt" and during_speech and ask is None and self.cfg.mode == "natural"
+                and too_short_to_interrupt(text)):
+            log(f"too short to be the person over our own voice: {text!r}", "debug")
+            return
         if ask is not None:
             rest = match_wake(text, self._wake_phrases(), self.cfg.wake_threshold)
             answer = classify_yes_no(rest if rest is not None else text)
@@ -1455,6 +1586,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 log("turn detection ready (Smart Turn v3)")
             except Exception as exc:
                 log(f"turn detection unavailable ({exc}); an utterance ends after {cfg.silence_ms} ms of silence", "warn")
+        speech = None
+        if cfg.speech_min_ms > 0 or cfg.speech_min_overlap_ms > 0:
+            try:
+                speech = SileroVAD().speech_ms
+            except Exception as exc:
+                log(f"speech check unavailable ({exc}); noise may be transcribed", "warn")
         log("loading Phonon voice; the first run downloads it")
         tts = PhononTTS(cfg)
         import webrtcvad
@@ -1478,7 +1615,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if cfg.chimes and name in chimes:
             play_once(chime_argv, chimes[name])
 
-    ctl = Controller(cfg, stt, lambda c: Speaker(tts, Player(player_argv), c.on_speaking), chime=chime, turn=turn)
+    ctl = Controller(cfg, stt, lambda c: Speaker(tts, Player(player_argv), c.on_speaking), chime=chime, turn=turn,
+                     speech=speech)
     ctl.listener.vad = lambda frame: vad_engine.is_speech(frame, MIC_RATE)
 
     take_over_socket(args.socket)
@@ -1497,6 +1635,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         while not stop_event.is_set():
             frame = mic.stdout.read(FRAME_BYTES)
             if not frame or len(frame) < FRAME_BYTES:
+                if stop_event.is_set():
+                    return  # shutting down: we killed it
                 err = mic.stderr.read().decode(errors="replace").strip() if mic.stderr else ""
                 emit("error", msg=f"microphone stopped ({' '.join(mic_argv[:1])}): {err[:300]}", fatal=True)
                 stop_event.set()

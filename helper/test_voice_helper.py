@@ -166,6 +166,21 @@ def test_echo_detection():
     assert not vh.is_echo("wait, use the other database", spoken)
 
 
+def test_garbled_echo_still_matches_what_was_said():
+    spoken = "Here is a longer answer to test the fix. I should get through this whole reply."
+    assert vh.is_echo("here is a longest answer to test the fixed", spoken)
+    assert not vh.is_echo("can you open the settings file instead", spoken)
+
+
+@pytest.mark.parametrize(
+    "text,short",
+    [("important", True), ("I love that.", False), ("Oh, nice.", True), ("Stop.", False),
+     ("Hold on!", False), ("Hey Claude", False), ("Wait, use the other database.", False)],
+)
+def test_too_short_to_interrupt(text, short):
+    assert vh.too_short_to_interrupt(text) is short
+
+
 def test_hallucinations_are_dropped():
     assert vh.is_hallucination("Thank you.")
     assert vh.is_hallucination("...")
@@ -577,6 +592,60 @@ def test_echo_tail_counts_as_during_speech():
     assert ctl.jobs.get(timeout=1)[3] is False
 
 
+def test_a_word_or_two_over_our_own_voice_is_dropped(events):
+    ctl, *_ = make_controller("natural")
+    ctl.speaker.last_spoken = "Here is a longer answer to test the fix."
+    ctl.handle_text("important", "voice", during_speech=True)
+    ctl.handle_text("Oh, nice.", "voice", during_speech=True)
+    assert events.of("transcript") == []
+    ctl.handle_text("Stop.", "voice", during_speech=True)  # a request to stop is short
+    ctl.handle_text("important", "voice")  # nothing playing: a one-word reply is fine
+    ctl.handle_text("ok", "ptt", during_speech=True)
+    assert [e["text"] for e in events.of("transcript")] == ["Stop.", "important", "ok"]
+
+
+def test_short_answers_to_a_question_are_not_held_to_the_overlap_rule(events):
+    ctl, *_ = make_controller("natural")
+    ctl.ask = vh.Ask("Run the tests?", listening=True)
+    ctl.handle_text("Yes.", "voice", during_speech=True)
+    assert ctl.ask.answer == "yes"
+
+
+def test_an_utterance_that_began_in_the_echo_tail_counts_as_during_speech():
+    ctl, *_ = make_controller("natural")
+    ctl.jobs = queue.Queue()
+    ctl.speaker.last_end = time.monotonic() - 2.5  # ended long ago...
+    two_seconds = bytes(2 * vh.MIC_RATE * 2)  # ...but the utterance began 2 s ago
+    ctl._on_utterance(two_seconds, "voice")
+    assert ctl.jobs.get(timeout=1)[3] is True
+
+
+def test_clips_without_a_human_voice_are_not_transcribed(events):
+    ctl, stt, *_ = make_controller("natural")
+    heard: list = []
+    ctl.speech = lambda audio: heard.append(len(audio)) or 0  # fan noise
+    stt.texts = ["I love that. Thank you."]
+    ctl.jobs.put(("final", bytes(vh.FRAME_BYTES * 40), "voice", False, None))
+    wait_until(lambda: heard and ctl.jobs.empty())
+    time.sleep(0.05)
+    assert stt.calls == 0 and events.of("transcript") == []
+    # push-to-talk is never second-guessed
+    ctl.jobs.put(("final", bytes(vh.FRAME_BYTES * 40), "ptt", False, None))
+    events.wait_for("transcript")
+    assert len(heard) == 1
+
+
+def test_over_our_own_voice_more_speech_is_needed(events):
+    ctl, stt, *_ = make_controller("natural")
+    ctl.speech = lambda audio: 450  # between speech_min_ms and speech_min_overlap_ms
+    stt.texts = ["could you check the logs", "could you check the logs"]
+    ctl.jobs.put(("final", bytes(vh.FRAME_BYTES * 40), "voice", True, None))
+    ctl.jobs.put(("final", bytes(vh.FRAME_BYTES * 40), "voice", False, None))
+    events.wait_for("transcript")
+    time.sleep(0.05)
+    assert stt.calls == 1 and len(events.of("transcript")) == 1
+
+
 LOUD = (np.ones(vh.FRAME_SAMPLES, dtype=np.int16) * 6000).tobytes()
 
 
@@ -613,6 +682,54 @@ def test_empty_transcript_while_speaking_is_ignored(events):
 def test_real_words_while_speaking_stop_the_speaker_and_are_delivered(events):
     ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0, silence_ms=300,
                                              min_utterance_ms=200)
+    ctl.speaker.last_spoken = "The build passed and I pushed the branch."
+    stt.texts = ["Wait, use the other database."] * 3
+    barge_while_speaking(ctl)
+    assert events.of("barge_in") and player.stopped >= 1
+    ctl.speaker.speaking = False
+    for _ in range(20):
+        ctl.listener.feed(silent_frame())
+    events.wait_for("transcript")
+    assert events.of("transcript")[-1]["text"] == "Wait, use the other database."
+
+
+def test_a_single_word_over_our_voice_waits_for_more_before_barging_in(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0)
+    ctl.speech = lambda audio: len(audio) * 1000 // vh.MIC_RATE  # all of it a voice
+    ctl.speaker.last_spoken = "Here is a longer answer to test the fix."
+    stt.texts = ["Important."]
+    barge_while_speaking(ctl)
+    assert not events.of("barge_in") and player.stopped == 0
+    lis = ctl.listener
+    assert lis.in_speech and lis.unverified  # still listening, not dropped
+    stt.texts = ["Wait, use the other database."]
+    for _ in range(30):
+        lis.feed(LOUD)
+    wait_until(lambda: lis.verdict is not None or not lis.unverified)
+    lis.feed(LOUD)
+    assert events.of("barge_in") and player.stopped >= 1
+
+
+def test_echo_that_never_turns_into_words_is_dropped_after_a_few_checks(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0)
+    ctl.speech = lambda audio: 0  # the echo canceller's leftovers: no human voice
+    lis = ctl.listener
+    barge_while_speaking(ctl)
+    for _ in range(vh.BARGE_IN_CHECKS):
+        for _ in range(vh.BARGE_IN_VERIFY_MS // vh.FRAME_MS + 1):
+            lis.feed(LOUD)
+            if not lis.in_speech:
+                break
+        wait_until(lambda: lis.verdict is not None or not lis.unverified or not lis.in_speech)
+        lis.feed(LOUD)
+    assert not events.of("barge_in") and player.stopped == 0 and stt.calls == 0
+    assert not lis.unverified
+
+
+def test_a_real_interruption_passes_the_speech_check(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0, silence_ms=300,
+                                             min_utterance_ms=200)
+    ctl.speech = lambda audio: len(audio) * 1000 // vh.MIC_RATE * 3 // 4
     ctl.speaker.last_spoken = "The build passed and I pushed the branch."
     stt.texts = ["Wait, use the other database."] * 3
     barge_while_speaking(ctl)
@@ -801,6 +918,11 @@ def test_main_end_to_end(events, monkeypatch):
     stt.texts = ["Hey Claude, what's the plan?"]
     monkeypatch.setattr(vh, "make_stt", lambda cfg: setattr(stt, "device", "cpu") or stt)
     monkeypatch.setattr(vh, "PhononTTS", lambda cfg: FakeTTS())
+
+    class Voice:  # the speech check, without downloading its model
+        speech_ms = staticmethod(lambda audio: len(audio) * 1000 // vh.MIC_RATE)
+
+    monkeypatch.setattr(vh, "SileroVAD", Voice)
     tmp = tempfile.mkdtemp()
     sock = os.path.join(tmp, "v.sock")
     # The "mic": 0.6 s silence, 1 s of loud noise (speech to the VAD), 1 s silence, then idle.

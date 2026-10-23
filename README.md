@@ -75,7 +75,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 /talk on
 ```
 
-The first start downloads Moonshine Streaming Medium from Moonshine AI's server (quantized; smaller than Parakeet's 650 MB), Phonon 31m (about 65 MB) and Smart Turn v3 (9 MB) from Hugging Face, which takes a minute. Parakeet, if you pick it, is about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
+The first start downloads Moonshine Streaming Medium from Moonshine AI's server (quantized; smaller than Parakeet's 650 MB), Phonon 31m (about 65 MB), Smart Turn v3 (9 MB) and the Silero VAD (2 MB) from Hugging Face, which takes a minute. Parakeet, if you pick it, is about 650 MB int8 for the CPU; on an NVIDIA GPU the CUDA runtime, about 2 GB, and the full model, about 2.4 GB. Later starts take a few seconds. A **Voice** pane opens with the live state, your tasks and the conversation.
 
 ### 4. Push-to-talk key (Hyprland)
 
@@ -167,7 +167,9 @@ Most of what remains is the recognizer itself (0.2 to 0.3 s for a short request 
 
 ## Natural mode without headphones: echo cancellation
 
-With speakers, the mic hears Claude's own voice. The helper needs a loud, sustained voice to barge in, and even then keeps talking until it has transcribed the first 0.8 s of it: only words Claude did not just say stop it. An echo canceller leaves Claude's voice loud enough to pass the level check but without recognizable words, so this check is what keeps it from cutting itself off; a real interruption takes about half a second longer to stop Claude than before. Speech that ends within 1.2 s after Claude stops (Bluetooth speakers lag) is still checked against what Claude said, and filler such as "yeah, thank you" is dropped there.
+With speakers, the mic hears Claude's own voice. The helper needs a loud, sustained voice to barge in, and even then keeps talking until it has transcribed the first 0.8 s of it: only words Claude did not just say stop it. Over Claude's voice, or within 1.2 s after it (Bluetooth speakers lag), the bar is higher: the clip must hold at least 0.6 s of human voice by the Silero VAD (an echo canceller's leftovers hold almost none), and at least three words, or a short request such as "stop", "wait" or "hold on". A word or two is not dropped at once: the helper listens for up to 2.4 s more before deciding, so a real interruption stops Claude within about one to two seconds. Words that match what Claude said, even garbled, and filler such as "yeah, thank you" are dropped there too.
+
+The same speech check keeps background noise out when nothing is playing: WebRTC VAD takes fans and clatter for speech, and the recognizer turns those clips into phantom phrases, so a hands-free clip with less than 0.25 s of human voice is never transcribed (the helper's `speech_min_ms` and `speech_min_overlap_ms`; 0 turns the check off). Push-to-talk is never second-guessed.
 
 PipeWire's echo canceller still helps a lot. A starting point, `~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`:
 
