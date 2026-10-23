@@ -167,7 +167,9 @@ Most of what remains is the recognizer itself (0.2 to 0.3 s for a short request 
 
 ## Natural mode without headphones: echo cancellation
 
-With speakers, the mic hears Claude's own voice. The helper ignores what it just said and needs a loud, sustained voice to barge in, but PipeWire's echo canceller works much better. A starting point, `~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`:
+With speakers, the mic hears Claude's own voice. The helper needs a loud, sustained voice to barge in, and even then keeps talking until it has transcribed the first 0.8 s of it: only words Claude did not just say stop it. An echo canceller leaves Claude's voice loud enough to pass the level check but without recognizable words, so this check is what keeps it from cutting itself off; a real interruption takes about half a second longer to stop Claude than before. Speech that ends within 1.2 s after Claude stops (Bluetooth speakers lag) is still checked against what Claude said, and filler such as "yeah, thank you" is dropped there.
+
+PipeWire's echo canceller still helps a lot. A starting point, `~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`:
 
 ```
 context.modules = [

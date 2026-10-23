@@ -126,6 +126,10 @@ class Config:
     barge_in: bool = True
     barge_in_rms: float = 0.03
     barge_in_ms: int = 300
+    # An utterance that ends within this long after Claude stops talking may
+    # still be its own voice: the room's echo, and Bluetooth speakers lag by
+    # 200 to 300 ms. Such utterances are checked against what was just said.
+    echo_tail_ms: int = 1200
     # Hands-free speech must be this many times louder than the background
     # noise floor (a slow running average of the mic level), so other voices
     # and the TV don't count as speech. 0 or less turns the check off.
@@ -294,6 +298,18 @@ def ends_mid_sentence(text: str) -> bool:
 def is_hallucination(text: str) -> bool:
     t = text.strip().lower()
     return t in HALLUCINATIONS or not re.search(r"[a-z0-9]", t)
+
+
+# Filler a recognizer makes of the echo of our own voice. Dropped only while
+# Claude speaks or just after, never as a reply on its own.
+ECHO_PHANTOMS = {
+    "yeah thank you", "thank you so much", "thank you very much", "okay thank you",
+    "oh", "uh", "um", "mm", "hmm",
+}
+
+
+def is_echo_phantom(text: str) -> bool:
+    return " ".join(normalize_words(text)) in ECHO_PHANTOMS
 
 
 def rms(frame: bytes) -> float:
@@ -755,6 +771,11 @@ class Speaker:
 NOISE_FLOOR_MS = 3000
 NOISE_FLOOR_MIN = 0.002
 
+# A barge-in is only taken once this much audio (pre-roll included)
+# transcribes to words Claude did not just say: an echo canceller leaves our
+# own voice loud enough to trip the level check, but without words in it.
+BARGE_IN_VERIFY_MS = 800
+
 
 class Listener:
     """Turns 30 ms mic frames into utterances.
@@ -772,7 +793,8 @@ class Listener:
                  on_utterance: Callable[[bytes, str, Optional[tuple[int, int]]], None],
                  is_speaking: Callable[[], bool], on_barge_in: Callable[[], None], on_hearing: Callable[[bool], None],
                  on_pause: Callable[[bytes, tuple[int, int]], None] = lambda audio, key: None,
-                 turn: Optional[Callable[[np.ndarray], float]] = None, check_text: bool = False):
+                 turn: Optional[Callable[[np.ndarray], float]] = None, check_text: bool = False,
+                 on_verify: Callable[[bytes, int], None] = lambda audio, n: None):
         self.cfg = cfg
         self.vad = vad
         # Probability that the person has finished, from the audio so far.
@@ -791,6 +813,14 @@ class Listener:
         self.is_speaking = is_speaking
         self.on_barge_in = on_barge_in
         self.on_hearing = on_hearing
+        # Checks whether a would-be barge-in has words in it (see verify_result).
+        self.on_verify = on_verify
+        # The utterance was started by a barge-in, which is not confirmed yet
+        # (unverified), or whose check is out (verify_sent).
+        self.barging = False
+        self.unverified = False
+        self.verify_sent = False
+        self.verdict: Optional[tuple[int, bool]] = None
         self.hands_free = True
         self.preroll: collections.deque[bytes] = collections.deque(maxlen=max(1, 450 // FRAME_MS))
         self.window: collections.deque[bool] = collections.deque(maxlen=10)
@@ -833,6 +863,8 @@ class Listener:
         self.silence = 0
         self.window.clear()
         self.loud_run = 0
+        self.barging = False
+        self.unverified = False
 
     def feed(self, frame: bytes) -> None:
         with self.lock:
@@ -847,15 +879,18 @@ class Listener:
 
         speaking = self.is_speaking()
         voiced = raw_voiced = self.vad(frame)
-        if speaking and self.cfg.barge_in and self.cfg.mode == "natural":
+        if speaking and self.cfg.barge_in and self.cfg.mode == "natural" and not self.barging:
             # Our own voice leaks into the mic: only a loud, sustained voice
-            # counts as the person cutting in.
+            # may be the person cutting in. Capture it, and stop talking once
+            # it turns out to have words in it that we did not just say.
             loud = voiced and rms(frame) >= self.cfg.barge_in_rms
             self.loud_run = self.loud_run + 1 if loud else 0
             if self.loud_run * FRAME_MS >= self.cfg.barge_in_ms:
-                self.on_barge_in()
-                self.loud_run = 0
+                voiced_frames = self.loud_run
                 self._start(frame)
+                self.voiced = voiced_frames
+                self.barging = self.unverified = True
+                self.verify_sent = False
             else:
                 self.preroll.append(frame)
             return
@@ -875,6 +910,8 @@ class Listener:
             return
 
         self.buf.append(frame)
+        if self.unverified and self._verify(speaking):
+            return
         self.silence = 0 if voiced else self.silence + 1
         self.voiced += 1 if voiced else 0
         if voiced:
@@ -896,6 +933,35 @@ class Listener:
             self._reset_vad()
             if voiced_ms >= self.cfg.min_utterance_ms:
                 self.on_utterance(audio, "voice", None if too_long else key)
+
+    # ---- barge-in check
+    def _verify(self, speaking: bool) -> bool:
+        """Send the would-be barge-in for checking, or act on the answer.
+
+        True when the utterance was dropped as our own voice.
+        """
+        verdict = self.verdict
+        if verdict is not None and verdict[0] == self.utterances:
+            self.verdict = None
+            self.unverified = False
+            if verdict[1]:
+                self.on_barge_in()
+            elif speaking:
+                self._reset_vad()
+                return True
+            # Claude finished meanwhile: carry on as an ordinary utterance.
+        elif not self.verify_sent and len(self.buf) * FRAME_MS >= BARGE_IN_VERIFY_MS:
+            self.verify_sent = True
+            self.on_verify(b"".join(self.buf), self.utterances)
+        return False
+
+    def verifying(self, n: int) -> bool:
+        """Is utterance n a barge-in still waiting for its check?"""
+        return self.unverified and self.utterances == n
+
+    def verify_result(self, n: int, ok: bool) -> None:
+        """The check of utterance n: does it hold words of the person's own?"""
+        self.verdict = (n, ok)
 
     def _track_noise(self, level: float) -> None:
         """Fold one frame into the background noise floor.
@@ -997,7 +1063,8 @@ class Controller:
         self.state = "idle"
         self.hearing = False
         self.transcribing = 0
-        # ("final", audio, source, during_speech, key) or ("early", audio, key)
+        # ("final", audio, source, during_speech, key), ("early", audio, key)
+        # or ("verify", audio, utterance number)
         self.jobs: "queue.Queue[tuple]" = queue.Queue()
         self.early: tuple[Optional[tuple[int, int]], str] = (None, "")
         self.speaker = speaker_factory(self)
@@ -1005,7 +1072,8 @@ class Controller:
                                  is_speaking=lambda: self.speaker.speaking,
                                  on_barge_in=self._on_barge_in, on_hearing=self._on_hearing,
                                  on_pause=self._on_pause, turn=turn,
-                                 check_text=turn is not None and cfg.stt_language.startswith("en"))
+                                 check_text=turn is not None and cfg.stt_language.startswith("en"),
+                                 on_verify=self._on_verify)
         self._apply_mode()
         threading.Thread(target=self._transcribe_loop, daemon=True, name="stt").start()
 
@@ -1082,8 +1150,20 @@ class Controller:
         emit("barge_in")
 
     def _on_utterance(self, audio: bytes, source: str, key: Optional[tuple[int, int]] = None) -> None:
-        during_speech = self.speaker.speaking or time.monotonic() - self.speaker.last_end < 0.6
+        tail = self.cfg.echo_tail_ms / 1000
+        during_speech = self.speaker.speaking or time.monotonic() - self.speaker.last_end < tail
         self.jobs.put(("final", audio, source, during_speech, key))
+
+    def _on_verify(self, audio: bytes, n: int) -> None:
+        self.jobs.put(("verify", audio, n))
+
+    def _is_own_voice(self, text: str) -> bool:
+        """Heard while (or just after) Claude spoke: is it Claude, not the person?
+
+        last_spoken already holds the sentence being spoken right now.
+        """
+        return (is_hallucination(text) or is_echo_phantom(text)
+                or is_echo(text, self.speaker.last_spoken))
 
     def _on_pause(self, audio: bytes, key: tuple[int, int]) -> None:
         self.jobs.put(("early", audio, key))
@@ -1123,6 +1203,19 @@ class Controller:
                     continue
                 self.listener.turn_text(key, self.early[1])
                 continue
+            if job[0] == "verify":
+                _, audio, n = job
+                if not self.listener.verifying(n):
+                    continue  # the utterance is over: its final job decides
+                try:
+                    text = self._transcribe(audio).strip()
+                except Exception as exc:
+                    log(f"barge-in check failed ({exc})", "warn")
+                    text = ""
+                ok = not self._is_own_voice(text)
+                log(f"barge-in {'taken' if ok else 'ignored'}: {text!r}", "debug")
+                self.listener.verify_result(n, ok)
+                continue
             _, audio, source, during_speech, key = job
             self.transcribing += 1
             self._publish()
@@ -1149,7 +1242,7 @@ class Controller:
         text = text.strip()
         if is_hallucination(text):
             return
-        if source != "ptt" and during_speech and is_echo(text, self.speaker.last_spoken):
+        if source != "ptt" and during_speech and self._is_own_voice(text):
             return
 
         ask = self.ask
@@ -1168,6 +1261,9 @@ class Controller:
             return
 
         if source == "ptt" or self.cfg.mode == "natural":
+            if source != "ptt" and self.speaker.speaking and self.cfg.barge_in:
+                # A barge-in that ended before its check came back.
+                self._on_barge_in()
             self._deliver(text, source)
             return
 

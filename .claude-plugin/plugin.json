@@ -1,6 +1,6 @@
 {
   "name": "voice-agent",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Talk with Claude out loud, fully local: Moonshine hears you, Phonon speaks, and agreed tasks go to background agents while you keep talking.",
   "author": {
     "name": "sabeel111"

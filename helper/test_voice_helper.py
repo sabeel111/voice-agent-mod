@@ -8,6 +8,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import queue
 import socket
 import sys
 import tempfile
@@ -330,7 +331,7 @@ def silent_frame():
     return np.zeros(vh.FRAME_SAMPLES, dtype=np.int16).tobytes()
 
 
-def make_listener(mode="natural", speaking=lambda: False, pauses=None):
+def make_listener(mode="natural", speaking=lambda: False, pauses=None, checks=None):
     got: list[tuple[int, str]] = []
     barge: list[int] = []
     cfg = vh.Config(mode=mode, silence_ms=300, early_ms=90, min_utterance_ms=200, loudness_ratio=0)
@@ -342,6 +343,7 @@ def make_listener(mode="natural", speaking=lambda: False, pauses=None):
         on_barge_in=lambda: barge.append(1),
         on_hearing=lambda h: None,
         on_pause=(lambda audio, key: pauses.append(key)) if pauses is not None else (lambda audio, key: None),
+        on_verify=(lambda audio, n: checks.append((len(audio), n))) if checks is not None else (lambda audio, n: None),
     )
     return lis, got, barge
 
@@ -460,16 +462,40 @@ def test_push_to_talk_captures_between_down_and_up():
 
 
 def test_barge_in_needs_sustained_loud_voice_in_natural_mode():
-    lis, got, barge = make_listener(speaking=lambda: True)
+    checks: list = []
+    lis, got, barge = make_listener(speaking=lambda: True, checks=checks)
     lis.cfg.barge_in_rms = 0.05
     quiet = (np.ones(vh.FRAME_SAMPLES, dtype=np.int16) * 800).tobytes()  # echo-level
     for _ in range(40):
         lis.feed(quiet)
-    assert barge == []
+    assert barge == [] and checks == []
     loud = (np.ones(vh.FRAME_SAMPLES, dtype=np.int16) * 6000).tobytes()
-    for _ in range(12):
+    for _ in range(30):
         lis.feed(loud)
+    # loud enough to check, but not taken until the words are
+    assert barge == [] and len(checks) == 1
+    assert checks[0][0] >= vh.BARGE_IN_VERIFY_MS // vh.FRAME_MS * vh.FRAME_BYTES
+    lis.verify_result(checks[0][1], True)
+    lis.feed(loud)
     assert barge == [1]
+
+
+def test_barge_in_that_checks_out_as_echo_is_dropped():
+    checks: list = []
+    lis, got, barge = make_listener(speaking=lambda: True, checks=checks)
+    loud = (np.ones(vh.FRAME_SAMPLES, dtype=np.int16) * 6000).tobytes()
+    for _ in range(30):
+        lis.feed(loud)
+    lis.verify_result(checks[0][1], False)
+    lis.feed(loud)
+    assert barge == [] and not lis.in_speech
+    for _ in range(20):
+        lis.feed(silent_frame())
+    assert got == []
+    # and the next loud run gets a check of its own
+    for _ in range(30):
+        lis.feed(loud)
+    assert len(checks) == 2 and checks[1][1] != checks[0][1]
 
 
 # --------------------------------------------------------------------------
@@ -528,6 +554,74 @@ def test_echo_of_our_own_voice_is_dropped(events):
     ctl.speaker.last_spoken = "The refactor is done and all tests pass."
     ctl.handle_text("the refactor is done and all tests pass", "voice", during_speech=True)
     assert events.of("transcript") == []
+
+
+def test_echo_phantoms_are_dropped_only_around_our_speech(events):
+    assert vh.is_echo_phantom("Yeah, thank you.")
+    assert not vh.is_echo_phantom("yeah")
+    ctl, *_ = make_controller("natural")
+    ctl.handle_text("Yeah, thank you.", "voice", during_speech=True)
+    assert events.of("transcript") == []
+    ctl.handle_text("Yeah, thank you.", "voice")
+    assert events.of("transcript")[-1]["text"] == "Yeah, thank you."
+
+
+def test_echo_tail_counts_as_during_speech():
+    ctl, *_ = make_controller("natural")
+    ctl.jobs = queue.Queue()  # out of the transcription thread's reach
+    ctl.speaker.last_end = time.monotonic() - 1.0  # Bluetooth lag: still echo
+    ctl._on_utterance(b"", "voice")
+    assert ctl.jobs.get(timeout=1)[3] is True
+    ctl.speaker.last_end = time.monotonic() - 2.0
+    ctl._on_utterance(b"", "voice")
+    assert ctl.jobs.get(timeout=1)[3] is False
+
+
+LOUD = (np.ones(vh.FRAME_SAMPLES, dtype=np.int16) * 6000).tobytes()
+
+
+def barge_while_speaking(ctl):
+    """Talk loudly over Claude until the barge-in check has answered."""
+    lis = ctl.listener
+    lis.vad = lambda f: vh.rms(f) > 0.01
+    ctl.speaker.speaking = True  # mid-sentence, as far as the listener can tell
+    for _ in range(30):
+        lis.feed(LOUD)
+    assert lis.verify_sent
+    wait_until(lambda: lis.verdict is not None or not lis.unverified)
+    lis.feed(LOUD)
+
+
+def test_echo_while_speaking_does_not_stop_the_speaker(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0)
+    ctl.speaker.last_spoken = "The build passed and I pushed the branch."
+    stt.texts = ["the build passed and I pushed"]
+    barge_while_speaking(ctl)
+    assert not events.of("barge_in") and player.stopped == 0
+    assert not ctl.listener.in_speech
+
+
+def test_empty_transcript_while_speaking_is_ignored(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0)
+    ctl.speaker.last_spoken = "The build passed and I pushed the branch."
+    stt.texts = [""]
+    barge_while_speaking(ctl)
+    assert not events.of("barge_in") and player.stopped == 0
+    assert not ctl.listener.in_speech
+
+
+def test_real_words_while_speaking_stop_the_speaker_and_are_delivered(events):
+    ctl, stt, _, player, _ = make_controller("natural", loudness_ratio=0, silence_ms=300,
+                                             min_utterance_ms=200)
+    ctl.speaker.last_spoken = "The build passed and I pushed the branch."
+    stt.texts = ["Wait, use the other database."] * 3
+    barge_while_speaking(ctl)
+    assert events.of("barge_in") and player.stopped >= 1
+    ctl.speaker.speaking = False
+    for _ in range(20):
+        ctl.listener.feed(silent_frame())
+    events.wait_for("transcript")
+    assert events.of("transcript")[-1]["text"] == "Wait, use the other database."
 
 
 def test_wake_word_while_speaking_interrupts(events):
